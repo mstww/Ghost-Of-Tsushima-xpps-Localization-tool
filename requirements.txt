@@ -1,0 +1,3 @@
+# No external dependencies required.
+# xpps_tool.py uses Python 3.8+ standard library only:
+#   os, sys, glob, struct, json, re, argparse, time

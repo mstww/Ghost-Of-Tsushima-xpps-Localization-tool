@@ -1,0 +1,32 @@
+# ── Translation output folders ──────────────────────────────────────────────
+translations/
+extracted_languages/
+
+# ── Game & Repack artefacts ──────────────────────────────────────────────────
+*.xpps
+repacked_output.xpps
+*_modded.xpps
+*_repacked.xpps
+Filenames.txt
+
+# ── PyInstaller build artefacts ──────────────────────────────────────────────
+build/
+dist/
+*.spec
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
