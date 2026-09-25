@@ -236,62 +236,65 @@ def repack_xpps(template_path, new_strings, output_path):
 
     desc_pos, t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = res
 
-    str_slots = []
+    new_sec_data = bytearray(sec_data)
+    append_blob = bytearray()
+    seen_append = {}
+
+    def get_append_offset(text):
+        enc = text.encode('utf-8') + b'\x00'
+        if enc not in seen_append:
+            seen_append[enc] = len(append_blob)
+            append_blob.extend(enc)
+        return seen_append[enc]
+
+    append_base_abs = sec_start + len(sec_data)
 
     # Table 1 – UI strings
     t1_start = t1_ptr - sec_start
-    t1_end_in_sec = t1_start + t1_cnt * 16
     for i in range(t1_cnt):
         off = t1_start + i * 16
         if off + 16 > len(sec_data):
             break
         h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
-        str_slots.append((off + 8, f"{h:016x}", s_off))
-
-    # Table 2 – param mappings
-    t2_start = t2_ptr - sec_start
-    t2_end_in_sec = t2_start + t2_cnt * 24
+        h_hex = f"{h:016x}"
+        if h_hex in new_strings:
+            str_p = s_off - sec_start
+            orig_text = _read_cstr(bytes(sec_data), str_p) if 0 <= str_p < len(sec_data) else ''
+            new_text = new_strings[h_hex]
+            if new_text != orig_text:
+                rel_off = get_append_offset(new_text)
+                struct.pack_into('<Q', new_sec_data, off + 8, append_base_abs + rel_off)
 
     # Table 3 – dialogue cues
     t3_start = t3_ptr - sec_start
-    t3_end_in_sec = t3_start + t3_cnt * 24
-    sub_arrays_end = t3_end_in_sec
-
     for i in range(t3_cnt):
         off = t3_start + i * 24
         if off + 24 > len(sec_data):
             break
         h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
-        sub_start = sub_p - sec_start
-        sub_end = sub_start + int(sub_cnt) * 16
-        if sub_end > sub_arrays_end:
-            sub_arrays_end = sub_end
-        for j in range(int(sub_cnt)):
-            se_off = sub_start + j * 16
-            if 0 <= se_off + 16 <= len(sec_data):
-                sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
-                str_slots.append((se_off + 8, f"{h:016x}", s_off))
+        h_hex = f"{h:016x}"
+        if h_hex in new_strings:
+            sub_start = sub_p - sec_start
+            parts = []
+            for j in range(int(sub_cnt)):
+                se_off = sub_start + j * 16
+                if 0 <= se_off + 16 <= len(sec_data):
+                    sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
+                    str_p = s_off - sec_start
+                    if 0 <= str_p < len(sec_data):
+                        parts.append(_read_cstr(bytes(sec_data), str_p).strip())
+            orig_combined = ' '.join(p for p in parts if p)
+            new_text = new_strings[h_hex]
+            if new_text != orig_combined:
+                for j in range(int(sub_cnt)):
+                    se_off = sub_start + j * 16
+                    if 0 <= se_off + 16 <= len(sec_data):
+                        txt = new_text if j == 0 else ""
+                        rel_off = get_append_offset(txt)
+                        struct.pack_into('<Q', new_sec_data, se_off + 8, append_base_abs + rel_off)
 
-    tables_end_in_sec = max(t1_end_in_sec, t2_end_in_sec, t3_end_in_sec, sub_arrays_end)
-    tables_end_in_sec = (tables_end_in_sec + 7) & ~7
-    if tables_end_in_sec > len(sec_data):
-        tables_end_in_sec = len(sec_data)
-
-    slot_texts = []
-    for (ptr_off, h_hex, s_off_abs) in str_slots:
-        str_p = s_off_abs - sec_start
-        orig_text = _read_cstr(bytes(sec_data), str_p) if 0 <= str_p < len(sec_data) else ''
-        slot_texts.append(new_strings.get(h_hex, orig_text))
-
-    blob, blob_offsets = _build_string_blob(slot_texts)
-    new_sec_data = bytearray(sec_data[:tables_end_in_sec]) + bytearray(blob)
-    new_blob_base_abs = sec_start + tables_end_in_sec
-
-    for idx, (ptr_off, h_hex, _) in enumerate(str_slots):
-        if ptr_off + 8 > len(new_sec_data):
-            raise ValueError(f"Pointer offset {ptr_off} exceeds section length.")
-        new_abs = new_blob_base_abs + blob_offsets[idx]
-        struct.pack_into('<Q', new_sec_data, ptr_off, new_abs)
+    if append_blob:
+        new_sec_data += append_blob
 
     new_sec0_size = len(new_sec_data)
     # Align new sec0 to 16 bytes:
