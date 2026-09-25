@@ -293,9 +293,47 @@ def repack_xpps(template_path, new_strings, output_path):
         new_abs = new_blob_base_abs + blob_offsets[idx]
         struct.pack_into('<Q', new_sec_data, ptr_off, new_abs)
 
-    new_sec_size = len(new_sec_data)
-    out_data = bytearray(data[:sec_abs]) + new_sec_data
-    struct.pack_into('<I', out_data, hdr_size - 52 + 4, new_sec_size)
+    new_sec0_size = len(new_sec_data)
+    # Align new sec0 to 16 bytes:
+    pad_len = (16 - (new_sec0_size % 16)) % 16
+    new_sec_data += b'\x00' * pad_len
+    new_sec0_size_aligned = len(new_sec_data)
+
+    out_header = bytearray(data[:hdr_size])
+    pre_sec0_data = bytes(data[hdr_size:sec_abs])
+
+    # Check for additional sections after sec0 (e.g. sec1 13.6MB data, sec2 127KB KNLI)
+    sec1_flags, sec1_size, sec1_offset = struct.unpack('<III', bytes(data[hdr_size-40 : hdr_size-28]))
+    sec2_flags, sec2_size, sec2_offset = struct.unpack('<III', bytes(data[hdr_size-28 : hdr_size-16]))
+
+    has_extra_sections = (sec1_size > 0 and sec1_offset > 0 and (hdr_size + sec1_offset + sec1_size <= len(data)))
+
+    if has_extra_sections:
+        sec1_abs = hdr_size + sec1_offset
+        sec2_abs = hdr_size + sec2_offset
+        sec1_data = bytes(data[sec1_abs : sec1_abs + sec1_size])
+        sec2_data = bytes(data[sec2_abs : sec2_abs + sec2_size])
+
+        # 1. Update sec0_size in descriptor
+        struct.pack_into('<I', out_header, hdr_size - 52 + 4, new_sec0_size_aligned)
+
+        # 2. Update sec1 offset in descriptor
+        new_sec1_offset = sec_start + new_sec0_size_aligned
+        struct.pack_into('<I', out_header, hdr_size - 40 + 8, new_sec1_offset)
+
+        # 3. Update sec2 offset in descriptor
+        new_sec2_offset = new_sec1_offset + sec1_size
+        struct.pack_into('<I', out_header, hdr_size - 28 + 8, new_sec2_offset)
+
+        # 4. Update total payload size at offset 0x2C
+        new_total_payload = new_sec2_offset + sec2_size
+        struct.pack_into('<I', out_header, 0x2C, new_total_payload)
+
+        out_data = out_header + pre_sec0_data + new_sec_data + sec1_data + sec2_data
+    else:
+        struct.pack_into('<I', out_header, hdr_size - 52 + 4, new_sec0_size_aligned)
+        struct.pack_into('<I', out_header, 0x2C, sec_start + new_sec0_size_aligned)
+        out_data = out_header + pre_sec0_data + new_sec_data
 
     out_dir = os.path.dirname(output_path)
     if out_dir:
@@ -304,7 +342,7 @@ def repack_xpps(template_path, new_strings, output_path):
     with open(output_path, 'wb') as f:
         f.write(out_data)
 
-    return new_sec_size
+    return len(out_data)
 
 
 def _load_strings(file_path):
@@ -421,11 +459,10 @@ def cmd_repack(args):
         output_path = f"{base}_modded{ext}"
 
     print(f"Loading translations from: {strings_file}")
-    with open(strings_file, 'r', encoding='utf-8') as f:
-        new_strings = json.load(f)
-
-    if not isinstance(new_strings, dict):
-        print("Error: Translation file must be a JSON object {hex_key: text}")
+    try:
+        new_strings = _load_strings(strings_file)
+    except Exception as e:
+        print(f"Error loading translation file: {e}")
         sys.exit(1)
 
     print(f"  Loaded strings: {len(new_strings)}")
