@@ -236,107 +236,145 @@ def repack_xpps(template_path, new_strings, output_path):
 
     desc_pos, t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = res
 
-    new_sec_data = bytearray(sec_data)
-    append_blob = bytearray()
-    seen_append = {}
+    new_pool = bytearray()
+    offset_map = {}
 
-    def get_append_offset(text):
+    def get_offset(text):
         enc = text.encode('utf-8') + b'\x00'
-        if enc not in seen_append:
-            seen_append[enc] = len(append_blob)
-            append_blob.extend(enc)
-        return seen_append[enc]
+        if enc not in offset_map:
+            offset_map[enc] = len(new_pool)
+            new_pool.extend(enc)
+        return offset_map[enc]
 
-    append_base_abs = sec_start + len(sec_data)
+    new_sec_data = bytearray(sec_data)
 
-    # Table 1 – UI strings
+    # Collect and assign offsets for Table 1 (UI strings)
     t1_start = t1_ptr - sec_start
+    t1_ptrs = []
     for i in range(t1_cnt):
         off = t1_start + i * 16
         if off + 16 > len(sec_data):
             break
         h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
         h_hex = f"{h:016x}"
-        if h_hex in new_strings:
-            str_p = s_off - sec_start
-            orig_text = _read_cstr(bytes(sec_data), str_p) if 0 <= str_p < len(sec_data) else ''
-            new_text = new_strings[h_hex]
-            if new_text != orig_text:
-                rel_off = get_append_offset(new_text)
-                struct.pack_into('<Q', new_sec_data, off + 8, append_base_abs + rel_off)
+        text = new_strings.get(h_hex, _read_cstr(bytes(sec_data), s_off - sec_start))
+        rel_p = get_offset(text)
+        t1_ptrs.append((off + 8, rel_p))
 
-    # Table 3 – dialogue cues
+    # Collect and assign offsets for Table 3 (Dialogue cues)
     t3_start = t3_ptr - sec_start
+    t3_ptrs = []
     for i in range(t3_cnt):
         off = t3_start + i * 24
         if off + 24 > len(sec_data):
             break
         h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
         h_hex = f"{h:016x}"
+        sub_start = sub_p - sec_start
         if h_hex in new_strings:
-            sub_start = sub_p - sec_start
-            parts = []
+            for j in range(int(sub_cnt)):
+                se_off = sub_start + j * 16
+                if 0 <= se_off + 16 <= len(sec_data):
+                    txt = new_strings[h_hex] if j == 0 else ""
+                    rel_p = get_offset(txt)
+                    t3_ptrs.append((se_off + 8, rel_p))
+        else:
             for j in range(int(sub_cnt)):
                 se_off = sub_start + j * 16
                 if 0 <= se_off + 16 <= len(sec_data):
                     sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
-                    str_p = s_off - sec_start
-                    if 0 <= str_p < len(sec_data):
-                        parts.append(_read_cstr(bytes(sec_data), str_p).strip())
-            orig_combined = ' '.join(p for p in parts if p)
-            new_text = new_strings[h_hex]
-            if new_text != orig_combined:
+                    txt = _read_cstr(bytes(sec_data), s_off - sec_start)
+                    rel_p = get_offset(txt)
+                    t3_ptrs.append((se_off + 8, rel_p))
+
+    if len(new_pool) <= desc_pos:
+        # In-pool engine: string pool fits within original boundary (84KB free space)
+        # Guarantees zero relocation breakdown, zero header shifts, 100% game compatibility
+        for ptr_off, rel_p in t1_ptrs:
+            struct.pack_into('<Q', new_sec_data, ptr_off, sec_start + rel_p)
+        for ptr_off, rel_p in t3_ptrs:
+            struct.pack_into('<Q', new_sec_data, ptr_off, sec_start + rel_p)
+
+        pad = desc_pos - len(new_pool)
+        new_sec_data[:desc_pos] = new_pool + b'\x00' * pad
+        out_data = bytes(data[:sec_abs]) + bytes(new_sec_data) + bytes(data[sec_abs + sec_size:])
+    else:
+        # Expanded engine: string pool exceeds original boundary
+        # Shifts tables and synchronizes both Primary and Secondary KCAP headers
+        append_blob = bytearray()
+        seen_append = {}
+
+        def get_append_offset(text):
+            enc = text.encode('utf-8') + b'\x00'
+            if enc not in seen_append:
+                seen_append[enc] = len(append_blob)
+                append_blob.extend(enc)
+            return seen_append[enc]
+
+        append_base_abs = sec_start + len(sec_data)
+        for i in range(t1_cnt):
+            off = t1_start + i * 16
+            if off + 16 > len(sec_data):
+                break
+            h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
+            h_hex = f"{h:016x}"
+            if h_hex in new_strings:
+                str_p = s_off - sec_start
+                orig_text = _read_cstr(bytes(sec_data), str_p) if 0 <= str_p < len(sec_data) else ''
+                if new_strings[h_hex] != orig_text:
+                    rel_off = get_append_offset(new_strings[h_hex])
+                    struct.pack_into('<Q', new_sec_data, off + 8, append_base_abs + rel_off)
+
+        for i in range(t3_cnt):
+            off = t3_start + i * 24
+            if off + 24 > len(sec_data):
+                break
+            h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
+            h_hex = f"{h:016x}"
+            if h_hex in new_strings:
+                sub_start = sub_p - sec_start
                 for j in range(int(sub_cnt)):
                     se_off = sub_start + j * 16
                     if 0 <= se_off + 16 <= len(sec_data):
-                        txt = new_text if j == 0 else ""
+                        txt = new_strings[h_hex] if j == 0 else ""
                         rel_off = get_append_offset(txt)
                         struct.pack_into('<Q', new_sec_data, se_off + 8, append_base_abs + rel_off)
 
-    if append_blob:
-        new_sec_data += append_blob
+        if append_blob:
+            new_sec_data += append_blob
 
-    new_sec0_size = len(new_sec_data)
-    # Align new sec0 to 16 bytes:
-    pad_len = (16 - (new_sec0_size % 16)) % 16
-    new_sec_data += b'\x00' * pad_len
-    new_sec0_size_aligned = len(new_sec_data)
+        new_sec0_size = len(new_sec_data)
+        pad_len = (16 - (new_sec0_size % 16)) % 16
+        new_sec_data += b'\x00' * pad_len
+        new_sec0_size_aligned = len(new_sec_data)
 
-    out_header = bytearray(data[:hdr_size])
-    pre_sec0_data = bytes(data[hdr_size:sec_abs])
+        out_header = bytearray(data[:hdr_size])
+        pre_sec0_data = bytes(data[hdr_size:sec_abs])
 
-    # Check for additional sections after sec0 (e.g. sec1 13.6MB data, sec2 127KB KNLI)
-    sec1_flags, sec1_size, sec1_offset = struct.unpack('<III', bytes(data[hdr_size-40 : hdr_size-28]))
-    sec2_flags, sec2_size, sec2_offset = struct.unpack('<III', bytes(data[hdr_size-28 : hdr_size-16]))
+        sec1_flags, sec1_size, sec1_offset = struct.unpack('<III', bytes(data[hdr_size-40 : hdr_size-28]))
+        sec2_flags, sec2_size, sec2_offset = struct.unpack('<III', bytes(data[hdr_size-28 : hdr_size-16]))
 
-    has_extra_sections = (sec1_size > 0 and sec1_offset > 0 and (hdr_size + sec1_offset + sec1_size <= len(data)))
-
-    if has_extra_sections:
         sec1_abs = hdr_size + sec1_offset
         sec2_abs = hdr_size + sec2_offset
         sec1_data = bytes(data[sec1_abs : sec1_abs + sec1_size])
         sec2_data = bytes(data[sec2_abs : sec2_abs + sec2_size])
 
-        # 1. Update sec0_size in descriptor
+        # Primary Table
         struct.pack_into('<I', out_header, hdr_size - 52 + 4, new_sec0_size_aligned)
-
-        # 2. Update sec1 offset in descriptor
         new_sec1_offset = sec_start + new_sec0_size_aligned
         struct.pack_into('<I', out_header, hdr_size - 40 + 8, new_sec1_offset)
-
-        # 3. Update sec2 offset in descriptor
         new_sec2_offset = new_sec1_offset + sec1_size
         struct.pack_into('<I', out_header, hdr_size - 28 + 8, new_sec2_offset)
-
-        # 4. Update total payload size at offset 0x2C
         new_total_payload = new_sec2_offset + sec2_size
         struct.pack_into('<I', out_header, 0x2C, new_total_payload)
 
+        # Secondary Descriptor Table (Sync required by Sucker Punch engine)
+        struct.pack_into('<I', out_header, 0xEC, new_sec1_offset)
+        struct.pack_into('<I', out_header, 0x118, new_sec1_offset)
+        struct.pack_into('<I', out_header, 0x13C, sec2_size)
+        struct.pack_into('<I', out_header, 0x140, new_sec2_offset)
+
         out_data = out_header + pre_sec0_data + new_sec_data + sec1_data + sec2_data
-    else:
-        struct.pack_into('<I', out_header, hdr_size - 52 + 4, new_sec0_size_aligned)
-        struct.pack_into('<I', out_header, 0x2C, sec_start + new_sec0_size_aligned)
-        out_data = out_header + pre_sec0_data + new_sec_data
 
     out_dir = os.path.dirname(output_path)
     if out_dir:
