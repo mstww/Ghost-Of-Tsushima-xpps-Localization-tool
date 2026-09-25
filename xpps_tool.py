@@ -308,11 +308,14 @@ def repack_xpps(template_path, new_strings, output_path):
 
 
 def _load_strings(file_path):
-    """Loads translations from .xpps or .json file."""
+    """Loads translations from .xpps, .bak, or .json file."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    if file_path.lower().endswith('.xpps'):
+    with open(file_path, 'rb') as f:
+        magic = f.read(4)
+
+    if magic == b'KCAP':
         return extract_xpps(file_path)
     else:
         with open(file_path, 'r', encoding='utf-8') as f:
