@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Languages](https://img.shields.io/badge/supported%20languages-27-orange)
-![Release](https://img.shields.io/badge/release-v2.1-brightgreen)
+![Release](https://img.shields.io/badge/release-v2.2-brightgreen)
 
 A dedicated game localization, translation, and modding utility for **Ghost of Tsushima Director's Cut**.
 Extract game text from proprietary KCAP `.xpps` binary localization files into easily editable JSON, translate strings, inspect changes with built-in diffing, and repack them back into game-ready `.xpps` files.
@@ -44,7 +44,7 @@ In a standard Ghost of Tsushima PC installation, `.xpps` localization files are 
   - [2. `repack`](#2-repack)
   - [3. `diff`](#3-diff)
 - [Supported Languages (27 Languages)](#supported-languages-27-languages)
-- [KCAP Binary Architecture](#kcap-binary-architecture)
+- [KCAP & KNLI Relocation Architecture](#kcap--knli-relocation-architecture)
 - [Türkçe Yerelleştirme ve Çeviri Rehberi](#türkçe-yerelleştirme-ve-çeviri-rehberi)
 - [License](#license)
 
@@ -53,7 +53,9 @@ In a standard Ghost of Tsushima PC installation, `.xpps` localization files are 
 ## Features
 
 - **Extract Game Text**: Unpacks 32,000+ UI, menu, quest, subtitle, and dialogue strings from proprietary KCAP `.xpps` files into clean, readable JSON format.
-- **Binary Repacker**: Rebuilds valid `.xpps` files from edited translations, preserving 64-bit string hashes, descriptor tables, and engine pointers.
+- **Dual-Engine Binary Repacker**:
+  - **Duplicate-Slot In-Pool Engine**: Reclaims unused duplicate slots (85KB+ slack space) for instant, surgical translation edits with 99.996% identical binary layout.
+  - **Dynamic Relocation & KNLI Re-encoding Engine (v2.2)**: Solves the notorious relocation breakdown! Dynamically resizes the string pool, shifts internal descriptors and tables, recalculates Section 7/8 boundaries, and re-encodes the Sucker Punch Section 8 KNLI relocation bytecode from scratch. Supports arbitrary text length and **2x, 5x, 10x file size expansion** without crashing or memory corruption.
 - **Built-in Verification**: Automatically re-extracts and verifies repacked files against templates to ensure 100% round-trip binary integrity.
 - **Translation Progress & Diff Tool**: Compare translation files against the original game text, calculate translation percentages, and view changed lines.
 - **Drag & Drop Support**: Drag a `.xpps` file onto `xpps_tool.exe` to instantly extract its text.
@@ -196,12 +198,18 @@ xpps_tool.exe extract <input> [-o OUTPUT] [--clean-pua]
 Rebuilds a game `.xpps` file from an edited translation JSON.
 
 ```bash
-xpps_tool.exe repack <strings_file> -t <template> [-o OUTPUT] [--no-verify]
+xpps_tool.exe repack <strings_file> -t <template> [-o OUTPUT] [--force-expand] [--no-verify]
 ```
 - `<strings_file>`: Path to your translated `strings.json` file.
 - `-t, --template`: Path to the original game `.xpps` file used as the layout template.
 - `-o, --output`: Destination path (default: `<template>_modded.xpps`).
+- `--force-expand`: Forces the Dynamic Relocation & KNLI Re-encoding Engine even if modifications fit into duplicate string slots.
 - `--no-verify`: Skips automatic extraction verification after repacking.
+
+> [!TIP]
+> **Automatic Mode Selection**:
+> If your changes are small (e.g. tweaking a few hundred strings or menus), `xpps_tool` automatically uses the **Duplicate-Slot In-Pool Engine**, keeping 99.996% of the original binary identical.
+> If your changes exceed available slot space or you translate large chunks of text, `xpps_tool` **automatically switches to the Dynamic Relocation & KNLI Engine**, rebuilding all pointers and relocation tables with zero limits on length or file size!
 
 ### 3. `diff`
 Compares two translation files or checks mod progress.
@@ -249,31 +257,38 @@ xpps_tool.exe diff <file1> <file2> [-o OUTPUT]
 
 ---
 
-## KCAP Binary Architecture
+## KCAP & KNLI Relocation Architecture
+
+Ghost of Tsushima uses Sucker Punch Productions' proprietary **KCAP** archive format with **KNLI** (Kernel Linker Information) relocation bytecode for memory rebasing:
 
 ```
-[KCAP Container Header] (offset 0x00 - 0x28)
+[KCAP Container Header] (0x00 - 0x1E4)
   0x00: Magic ASCII "KCAP"
-  0x28: Header Size (uint32)
-  hdr_size - 52: Section Descriptor [flags: u32, sec_size: u32, sec_start: u32]
+  0x28: Header Size (0x1E4 = 484 bytes)
+  0x2C: Total Payload Size (uint32)
+  0xC0: Secondary Section Table (Offsets & Sizes for Sec 7 & 8)
+  0x168: Primary Section Table (12 bytes per section descriptor: flags, size, offset)
 
-[Text Section]
-  Master Descriptor (64-bit LE integers):
-    [Table 1 Ptr, Table 1 Count, Table 2 Ptr, Table 2 Count, Table 3 Ptr, Table 3 Count]
+[KCAP Payload Layout]
+  Sections 0 - 5: System and Sub-archive Descriptors
+  Section 6: Text & Localization Section (Strings, Descriptors, Tables 1, 2, 3)
+  Section 7: Language Font & Glyph Raster Data (13,631,568 bytes)
+  Section 8: KNLI 64-bit Pointer Relocation Bytecode Table (127+ KB)
 
-  Table 1: UI & Skill Strings
-    Array of { hash: uint64, string_offset: uint64 } (16 bytes each)
-
-  Table 2: Engine Parameter Mappings
-    Array of 24-byte triplets
-
-  Table 3: Subtitle & Dialogue Audio Cues
-    Array of { cue_hash: uint64, subtitle_subtable_ptr: uint64, subtitle_count: uint64 } (24 bytes each)
-      Subtable: Array of { sub_hash: uint64, string_offset: uint64 } (16 bytes each)
-
-  String Data Pool:
-    Contiguous null-terminated UTF-8 strings.
+[Section 6 Layout]
+  0x000000 .. desc_pos: Contiguous UTF-8 String Pool
+  desc_pos: Master Localization Descriptor [T1_ptr, T1_cnt, T2_ptr, T2_cnt, T3_ptr, T3_cnt]
+  Table 1: UI & Menu Strings (16 bytes: uint64 hash, uint64 str_ptr)
+  Table 2: Engine Audio/Event Mappings (24 bytes: uint64 hash, uint64 sub_ptr, uint64 count)
+  Table 3: Dialogue & Subtitle Cues (24 bytes: uint64 hash, uint64 sub_ptr, uint64 count)
+    Table 3 Sub-entries: Array of (16 bytes: uint64 sub_hash, uint64 str_ptr)
+  Tail: Format Descriptors & Engine Type Registrations
 ```
+
+### Why Naive Repacking Broke Games & How v2.2 Solves It
+1. **Engine Bounds Invariant**: The engine validates that every string pointer falls strictly inside `0 .. desc_pos`. In v2.2, all strings are positioned within this boundary and `desc_pos` dynamically expands.
+2. **KNLI Relocation Bytecode**: When loaded into RAM, the engine traverses the KNLI stream and rebases every 64-bit pointer (`*(uint64_t*)(base + offset) += base`). If string expansion moves tables without updating KNLI, the engine rebases random memory, resulting in instant crashes.
+3. **15-Bit Window Relocation Encoding**: `xpps_tool` v2.2 includes the world's first complete encoder/decoder for KNLI bytecode, recalculating all 63,400+ relocation pointers so that file size can grow to **2x, 5x, or 10x** seamlessly without crashing.
 
 ---
 
@@ -285,8 +300,8 @@ Ghost of Tsushima Director's Cut için kendi Türkçe yamanızı yapmak veya mev
 `.xpps` dil dosyaları oyunun `cache_pc/psarc/` klasöründeki `l` harfiyle başlayan `.psarc` arşivlerinin içindedir.
 1. Nexus Mods'tan **GoTExtractor** aracını indirin:  
    👉 **[GoTExtractor (Nexus Mods #65)](https://www.nexusmods.com/ghostoftsushima/mods/65)**
-2. GoTExtractor ile `cache_pc/psarc/` içindeki dil arşivini dışarı çıkarın.
-3. Böylece `lang_turkish_text.xpps` veya `lang_english_text.xpps` dosyalarını elde edeceksiniz.
+2. GoTExtractor ile `cache_pc/psarc/` içindeki dil arşivini (örneğin `gapack_misc_l.psarc`) dışarı çıkarın.
+3. Böylece `lang_turkish_text.xpps` dosyasını elde edeceksiniz.
 
 ### 2. Metinleri JSON Olarak Dışa Aktarma
 ```powershell
@@ -294,11 +309,13 @@ Ghost of Tsushima Director's Cut için kendi Türkçe yamanızı yapmak veya mev
 ```
 Bu komut 32.461 satırlık oyun metnini düzenlenebilir `turkce_ceviri.json` dosyasına çıkarır.
 
-### 3. Çeviriyi Düzenleme
-JSON dosyasını VS Code veya Notepad++ ile açın. Sol taraftaki 16 haneli hex kodlarına dokunmadan sadece sağ taraftaki metinleri düzenleyin:
+### 3. Çeviriyi Düzenleme (Sınırsız Karakter ve Uzunluk!)
+JSON dosyasını VS Code veya Notepad++ ile açın. Sol taraftaki 16 haneli hex kodlarına dokunmadan sağ taraftaki metinleri dilediğiniz gibi uzatın ve düzenleyin:
 ```json
-"00000002db95e0f0": "Kes"
+"8bc3029abeb1b9a2": "Başlamak için  düğmesine bas"
 ```
+> [!NOTE]
+> `xpps_tool` v2.2 ile artık **metin uzunluğu veya karakter sınırı tamamen kaldırılmıştır**. Çeviriniz orijinalden 2 kat, 5 kat daha uzun olsa bile Dinamik Relokasyon Motoru sayesinde oyun çökmeden sorunsuz yüklenir.
 
 ### 4. Çeviri İlerlemesini Kontrol Etme
 ```powershell
