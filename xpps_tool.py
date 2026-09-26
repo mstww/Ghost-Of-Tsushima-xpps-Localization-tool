@@ -480,10 +480,14 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
                     new_off = add_to_pool(txt)
                     other_string_ptrs.append((rel_p, new_off))
 
-        pad_len = (16 - (len(new_pool) % 16)) % 16
-        new_pool.extend(b'\x00' * pad_len)
+        # 1. Enforce SIMD 16-byte alignment invariant (desc_pos % 16 must be 8)
+        # In all official game files (Thai, Greek, Russian, etc.), desc_pos % 16 == 8
+        # so that t1_ptr (desc_pos + sec_start + 72) is strictly 16-byte SIMD vector aligned.
+        while (len(new_pool) % 16) != 8:
+            new_pool.append(0)
         if len(new_pool) < desc_pos:
-            new_pool.extend(b'\x00' * (desc_pos - len(new_pool)))
+            while len(new_pool) < desc_pos or (len(new_pool) % 16) != 8:
+                new_pool.append(0)
 
         new_desc_pos = len(new_pool)
         delta = new_desc_pos - desc_pos
@@ -508,25 +512,45 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
             rel_tbl_p = ptr_loc - desc_pos
             struct.pack_into('<Q', tables_block, rel_tbl_p, sec_start + new_off)
 
-        for tb_i in range(0, len(tail_bytes) - 4, 4):
-            v32 = struct.unpack('<I', bytes(tail_bytes[tb_i:tb_i+4]))[0]
-            if sec_start <= v32 <= sec_start + sec_size:
-                struct.pack_into('<I', tail_bytes, tb_i, v32 + delta)
+        # 2. Update KNLI tail_bytes pointers
+        # In KNLI bytecode tail, the 7 Section 0 root pointers appear as (orig_ptr + 16)
+        s0_rel_offs = [0x010, 0x020, 0x030, 0x040, 0x050, 0x060, 0x068]
+        for p_off in s0_rel_offs:
+            orig_ptr = struct.unpack('<I', data[hdr_size + p_off : hdr_size + p_off + 4])[0]
+            tv = orig_ptr + 16
+            enc = struct.pack('<I', tv)
+            pos = tail_bytes.find(enc)
+            while pos != -1:
+                struct.pack_into('<I', tail_bytes, pos, tv + delta)
+                pos = tail_bytes.find(enc, pos + 4)
 
         new_s6_data = new_pool + tables_block
+        pad_s6 = (16 - (len(new_s6_data) % 16)) % 16
+        new_s6_data.extend(b'\x00' * pad_s6)
         new_s6_size = len(new_s6_data)
 
         orig_sec7_off = sec_start + sec_size
         new_sec7_off = sec_start + new_s6_size
 
+        # 3. Update Section 0 root pointers and Section 1..6 font data pointers
         new_hdr_payload = bytearray(data[hdr_size : hdr_size + sec_start])
+
+        # Shift all 7 Section 0 root pointers (0x1F4..0x24C) by delta:
+        for p_off in s0_rel_offs:
+            val = struct.unpack('<I', new_hdr_payload[p_off : p_off + 4])[0]
+            struct.pack_into('<I', new_hdr_payload, p_off, val + delta)
+
+        # Shift the 6 Section 1..6 font data pointers in KNLI relocations:
+        for r in orig_relocs:
+            if r < sec_start:
+                val = struct.unpack('<I', bytes(new_hdr_payload[r:r+4]))[0]
+                if val >= orig_sec7_off:
+                    struct.pack_into('<I', new_hdr_payload, r, val + delta)
+
         new_relocs = []
         for r in orig_relocs:
             if r < sec_start:
                 new_relocs.append(r)
-                val = struct.unpack('<Q', bytes(new_hdr_payload[r:r+8]))[0]
-                if val == orig_sec7_off:
-                    struct.pack_into('<Q', new_hdr_payload, r, new_sec7_off)
             else:
                 new_relocs.append(r + delta)
 
