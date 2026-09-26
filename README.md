@@ -9,6 +9,12 @@
 A dedicated game localization, translation, and modding utility for **Ghost of Tsushima Director's Cut**.
 Extract game text from proprietary KCAP `.xpps` binary localization files into easily editable JSON, translate strings, inspect changes with built-in diffing, and repack them back into game-ready `.xpps` files.
 
+The repository also contains **`got_font_tool`** — a font editor (GUI + CLI) for the in-game fonts: preview your
+translation in the real game fonts, find missing letters, add glyphs from any TTF/OTF, replace whole fonts, fix
+spacing and put logos/icons into the font. See **[Font Tool](#font-tool-got_font_tool)**.
+
+![got_font_tool preview](docs/font_tool_preview.png)
+
 
 > **v3.0 — repack engine rewritten.** The v2.x "dynamic relocation" mode produced broken files as soon as the
 > text no longer fit the original pool: it read the KNLI reloc count as a pointer count (so padding and the
@@ -67,6 +73,15 @@ In a standard Ghost of Tsushima PC installation, `.xpps` localization files are 
   - [1. `extract`](#1-extract)
   - [2. `repack`](#2-repack)
   - [3. `diff`](#3-diff)
+- [Font Tool (`got_font_tool`)](#font-tool-got_font_tool)
+  - [What fonts does the game have?](#what-fonts-does-the-game-have)
+  - [Installation & start](#installation--start)
+  - [Recommended translation workflow with fonts](#recommended-translation-workflow-with-fonts)
+  - [GUI guide](#gui-guide)
+  - [CLI reference (`got_font_tool`)](#cli-reference-got_font_tool)
+  - [Editing fonts by hand (PNG + JSON)](#editing-fonts-by-hand-png--json)
+  - [Tips, limits and troubleshooting](#tips-limits-and-troubleshooting)
+  - [Font format (for reverse engineers)](#font-format-for-reverse-engineers)
 - [Supported Languages (27 Languages)](#supported-languages-27-languages)
 - [KCAP & KNLI Relocation Architecture](#kcap--knli-relocation-architecture)
 - [Türkçe Yerelleştirme ve Çeviri Rehberi](#türkçe-yerelleştirme-ve-çeviri-rehberi)
@@ -86,6 +101,7 @@ In a standard Ghost of Tsushima PC installation, `.xpps` localization files are 
 - **Standalone Release**: Includes a pre-compiled Windows `.exe` (`xpps_tool.exe`) — no Python or environment setup needed.
 - **Pure Python**: Zero external dependencies when running from source (`os`, `struct`, `json`, `re`, `argparse`).
 - **Clean PUA Glyphs Option**: Option to strip gamepad button icons (Square, Cross, Circle) for clean text editing.
+- **Font Tool (`got_font_tool`, GUI + CLI)**: preview text in the game fonts, list missing characters of your translation, add glyphs from TTF/OTF (size, baseline, SDF and kerning matched automatically), replace fonts, edit glyph spacing, add logo/icon glyphs, export/import atlases as PNG + JSON.
 
 ---
 
@@ -107,6 +123,11 @@ cd Ghost-Of-Tsushima-xpps-Localization-tool
 
 # Standard library only — no pip install needed!
 python xpps_tool.py --help
+
+# the font tool needs a few packages (tkinter ships with Python on Windows)
+pip install -r requirements.txt
+python got_font_tool.py            # opens the GUI
+python got_font_tool.py --help     # command line
 ```
 
 ---
@@ -130,6 +151,8 @@ python xpps_tool.py --help
        │  (Check with xpps_tool diff)
        ▼
  [lang_*_text.xpps]  (Repack with xpps_tool repack)
+       │
+       │  (optional: fonts with got_font_tool — missing letters, logos, other fonts)
        │
        │  (Repack with got_psarc_tool pack)
        ▼
@@ -256,6 +279,212 @@ xpps_tool.exe diff <file1> <file2> [-o OUTPUT]
 
 ---
 
+## Font Tool (`got_font_tool`)
+
+`got_font_tool` edits the fonts that the game uses to draw text. It has a **graphical interface** (default —
+just double-click `got_font_tool.exe`) and a full **command line** (`got_font_tool.exe --help`) for scripts.
+
+![Glyphs tab](docs/font_tool_glyphs.png)
+
+What a translator can do with it:
+
+| Task | GUI | CLI |
+|------|-----|-----|
+| See any text (or any line of your `strings.json`) in the real game fonts | **Preview** tab | `preview` |
+| Find letters your translation needs but a font does not have | **Missing characters** tab | `list --from-json` |
+| Add those letters from any TTF/OTF font (auto size/baseline, SDF, kerning) | **Add glyphs from TTF/OTF** | `add` |
+| Replace a whole font (e.g. a title font that suits your language better) | **Replace font with TTF/OTF** | `replace` |
+| Fix the spacing of a glyph (advance / x / y offset) or delete it | **Glyphs** tab | `export` → edit JSON → `import` |
+| Put a logo / icon / symbol into the font and use it in text | **Add image glyph** | `addimg` |
+| Edit atlases by hand in Photoshop/GIMP | **Export fonts** / **Import fonts from folder** | `export` / `import` |
+| Check a file before putting it into the game | **Verify file** | `verify` |
+
+### What fonts does the game have?
+
+The fonts are **inside every language pack** `lang_<language>_text.xpps` (archive `gapack_misc_l.psarc`), so each
+language has its own copy and you only change the language you translate. A typical pack contains:
+
+| Used for (as shown by the tool) | Size | Glyphs | Notes |
+|---|---|---|---|
+| **Text** | 130 | ~484 | subtitles, dialogue, descriptions (Latin, Greek, Cyrillic, Turkish…) |
+| **UI** (two fonts) | 146 / 133 | ~332 | menus, HUD, labels |
+| **Title** | 624 | ~255 | big titles (language specific) |
+| **Main menu (caps)** | ~1050–1250 | ~117–180 | main-menu entries; the game shows them in UPPER CASE |
+| **Button icons** | 50 | 210 | gamepad/keyboard icons in the Private Use Area — block compressed, **not editable** |
+
+Japanese, Chinese and Korean packs also contain big CJK fonts (1300–3200 glyphs), Thai has an extra title font.
+All fonts are **signed distance fields** (SDF): each glyph is stored as a distance map, so it stays sharp at any
+size, and the tool creates new glyphs in exactly the same way (same spread and slope as the original ones).
+
+### Installation & start
+
+* **Windows exe:** download `got_font_tool.exe` from [Releases](../../releases) and double-click it — the GUI opens.
+  Drag a `.xpps` onto the exe to open it directly. For the command line run it from a terminal with arguments.
+* **Python:** `pip install -r requirements.txt` (numpy, Pillow, scipy, fontTools), then `python got_font_tool.py`.
+* The interface is in English; **Language → Türkçe** switches it to Turkish.
+
+### Recommended translation workflow with fonts
+
+`xpps_tool repack` always starts from its template file. Do the font work **once on the original file** and
+use the result as the template for every later text repack — then you never have to redo the fonts:
+
+```bash
+# 1. unpack the archive (keep a backup of the original!)
+got_psarc_tool.exe unpack gapack_misc_l.psarc
+copy gapack_misc_l\lang_turkish_text.xpps lang_turkish_text.xpps.bak
+
+# 2. translate as usual
+xpps_tool.exe extract lang_turkish_text.xpps.bak -o tr.json
+#    ... edit tr.json ...
+
+# 3. which letters are missing? (GUI: "Missing characters" tab)
+got_font_tool.exe list lang_turkish_text.xpps.bak --from-json tr.json
+
+# 4. add them to all fonts from a TTF/OTF and save as the new template
+got_font_tool.exe add lang_turkish_text.xpps.bak --ttf MyFont.ttf --from-json tr.json --kern -o lang_turkish_text.fonts.xpps
+
+# 5. repack the text using the font-edited file as template (repeat this step whenever tr.json changes)
+xpps_tool.exe repack tr.json -t lang_turkish_text.fonts.xpps -o gapack_misc_l\lang_turkish_text.xpps
+
+# 6. rebuild the archive and copy it to cache_pc/psarc/
+got_psarc_tool.exe pack gapack_misc_l gapack_misc_l.psarc
+```
+
+If the translation later needs more new letters, run step 4 again on `lang_turkish_text.fonts.xpps` (the tool
+can edit its own output as often as you like) and repack. The font tool can also be run on an already repacked
+file — both tools keep each other's data and relocation tables intact.
+
+### GUI guide
+
+**Toolbar / menus** — *Open .xpps*, *Save as*, *Undo* (last 4 operations), *Revert* (File menu: reload from
+disk), *Add glyphs from TTF/OTF*, *Replace font with TTF/OTF*, *Add image glyph*, *Export fonts*, *Import fonts
+from folder*, *Verify file*. All edits stay in memory until you **Save as**; saving writes the file, verifies it
+and reloads it. The title bar shows `*` while there are unsaved changes.
+
+**Font list (left)** — every font of the file with its role, size, glyph count and atlas size. Select a font to
+work with it; the box below shows details (virtual/texture size, spread, number of kerning pairs).
+
+**Preview tab**
+* Type any text, or choose a *Sample text* (pangrams for Turkish, English, German, French, Spanish, Portuguese,
+  Italian, Polish, Czech, Hungarian, Romanian, Russian, Ukrainian, Greek, Vietnamese, Nordic).
+* **Load strings.json…** loads your `xpps_tool` translation; use *Search* to find a line (by text or hash) and
+  click it to see exactly how the game will draw it.
+* Options: size, *Dark background* (game-like), *UPPER CASE* (how the main menu shows text), *Glyph boxes*
+  (shows each glyph's quad — useful for spacing problems), *All fonts* (renders the text with every font at once).
+* Characters that the selected font does not have are listed in red under the options — in the game they would
+  be drawn as an empty box.
+
+**Glyphs tab**
+* A grid of all glyphs (search by characters, e.g. `ğüşİ`, or code points, e.g. `U+2605`).
+* Click a glyph to see it large, its Unicode name, atlas box, offsets, a context sample (`HxH nxn xxx`) and all of
+  its kerning pairs.
+* Change **Advance** (width), **X offset**, **Y offset** and press **Apply** to fix spacing; **Delete glyph**
+  removes it (and kerning pairs that point to it).
+
+**Atlas tab** — the SDF texture of the font (fit / 25 / 50 / 100 %), optional glyph boxes. Click a glyph in the
+atlas to jump to it in the Glyphs tab.
+
+**Missing characters tab** — paste text or load a `strings.json` / `.txt`, press **Check**: each font gets a
+row with the number and list of missing characters (the main-menu font is checked against the upper-cased
+text). **Add missing characters from TTF…** opens the add dialog pre-filled with exactly those characters and fonts.
+
+**Add glyphs dialog** — choose a TTF/OTF (the file dialog opens in `C:\Windows\Fonts`), the characters and the
+target fonts. Options: *Import kerning from the font*, *Re-render characters that already exist* (to change the
+look of existing letters), *Size multiplier* (1.0 = matched automatically to the game font's cap height),
+*Baseline shift* (virtual px, + moves down), and what to do when the atlas is full (grow one side = smaller file,
+the same 2:1 shape the game uses for its CJK fonts; or grow both sides).
+
+**Replace font dialog** — rebuilds every glyph of the selected fonts from the TTF/OTF (the charset is kept;
+characters the TTF lacks keep their original glyph; kerning is taken from the TTF). *Extra characters* are added
+on top.
+
+**Add image glyph dialog** — a PNG (transparent background, or white shape on black; tick *Black shape on white
+background* for the opposite) is turned into an SDF glyph at the chosen character, e.g. `★` / `U+2605`. Height,
+part below the baseline and side spacing are relative to the font's cap height. Use a character that no font
+uses and that is **not** in the Private Use Area (U+E000–U+F8FF is taken by the button icons). Then write that
+character into your translation, e.g. `"Destan Moduna Gir ★"`.
+
+**Log tab** — output of every operation, including verification results.
+
+### CLI reference (`got_font_tool`)
+
+Running without arguments (or with only a file) opens the GUI. All editing commands write to `-o OUTPUT`
+(default `<name>_font.xpps`) and verify the result.
+
+| Command | Description |
+|---------|-------------|
+| `gui [file.xpps]` | open the GUI |
+| `list <xpps> [--chars S] [--charfile F] [--from-json J]` | fonts in the file and the characters each one is missing |
+| `export <xpps> [dir] [--font LIST]` | write `fontN_<hash>.png` (atlas) + `fontN_<hash>.json` (metrics, kerning) |
+| `import <xpps> <dir> [-o OUT]` | read the PNG/JSON back (glyphs may be added/removed, PNG may be enlarged) |
+| `add <xpps> --ttf F (--chars/--charfile/--from-json) [--font LIST] [--kern] [--replace-existing]` | render glyphs from a TTF/OTF |
+| `replace <xpps> --ttf F [--font LIST] [--chars ...] [--no-kern]` | rebuild whole fonts from a TTF/OTF |
+| `addimg <xpps> --image PNG --cp U+2605 [--font LIST] [--height 1.2] [--drop 0.1] [--bearing 0.08] [--invert]` | glyph from an image |
+| `remove <xpps> --chars S [--font LIST]` | delete glyphs |
+| `preview <xpps> --text "..." [--font LIST] [--height 96] [--upper] [-o PNG]` | render text to a PNG |
+| `verify <xpps>` | check relocations, glyph tables and textures |
+
+Common options of `add` / `replace`: `--scale 1.05` (bigger/smaller than the automatic match),
+`--baseline-shift 4`, `--grow rect|square`, `--preview "text"` (also writes a preview PNG).
+`--font` takes indexes or hash prefixes from `list`, e.g. `--font 0,1,4`; the default is all editable fonts.
+
+```bash
+got_font_tool.exe list    lang_polish_text.xpps --chars "ĄąĆćĘęŁłŃńÓóŚśŹźŻż"
+got_font_tool.exe add     lang_english_text.xpps --ttf C:\Windows\Fonts\segoeui.ttf --from-json vi.json --kern -o vi.xpps
+got_font_tool.exe replace lang_turkish_text.xpps --font 3 --ttf MyTitle.otf --preview "HAYALET" -o tr.xpps
+got_font_tool.exe addimg  tr.xpps --image logo.png --cp U+2605 --preview "Test ★" -o tr_logo.xpps
+got_font_tool.exe preview tr_logo.xpps --font 2 --upper --text "Destan Moduna Gir ★"
+```
+
+### Editing fonts by hand (PNG + JSON)
+
+`export` writes, per font, an upright atlas `fontN_<hash>.png` and `fontN_<hash>.json`:
+
+```json
+{ "size": 130, "spread": 19, "virtual_width": 2048, "virtual_height": 2048,
+  "texture_width": 512, "texture_height": 512,
+  "glyphs": [ { "cp": 65, "char": "A", "x": 555, "y": 1332, "w": 91, "h": 98,
+                "xoff": -20, "yoff": 14, "adv": 51, "kern": [[86, -3]] } ] }
+```
+
+* Coordinates are **virtual pixels** (`texture px × virtual / texture`), top-left origin. The box contains
+  `spread` px of SDF padding on every side.
+* `xoff` / `yoff` place the box relative to the pen position / top of the line, `adv` is the advance width.
+* `kern` is a list of `[second_codepoint, amount]` (a code point may appear twice — keep the order).
+* The PNG is an SDF: 128 = the outline, brighter = inside. Paint with soft gradients, not hard black/white.
+* The PNG may change size (powers of two). If you **upscale** the whole atlas keep `virtual_*`; if you **extend
+  the canvas** (more room at the right/bottom) multiply `virtual_width/height` by the same factor.
+* `import` accepts added and removed glyphs; the file grows automatically when needed.
+
+### Tips, limits and troubleshooting
+
+* **An empty box in the game** means the font used there does not have that character. The main menu uses the
+  *Main menu (caps)* font, subtitles the *Text* font, menus the *UI* fonts — when unsure add to all fonts.
+* Only characters in the Basic Multilingual Plane (U+0000–U+FFFF) are supported by the game's glyph tables.
+* The *Button icons* font is block compressed and cannot be edited (it is exported as a raw `.bin`).
+* Growing an atlas makes the file bigger (e.g. 512×512 → 512×1024 ≈ +0.35 MB, 2048×2048 → 2048×4096 ≈ +5.6 MB).
+* Right-to-left scripts and complex shaping (Arabic joining, Indic/Thai reordering) are not done by the
+  game's renderer — the glyphs are drawn one after another as stored.
+* Always keep the untouched original `.xpps`/`.psarc`. `verify` checks every relocation and glyph table.
+* Replacing a font changes its look everywhere in that language; check long texts in the Preview tab with
+  *Glyph boxes* on to see if the new font is wider than the old one.
+
+### Font format (for reverse engineers)
+
+```
+font header (0x40): u64 hash | u32 id | f32 1/size | u16 size | u16 spread | f32 1/Vw | f32 1/Vh | f32 (1.0 or scale)
+                    | u64 | u64 ->glyphs | u32 count | u32 0 | u64 ->texture desc+0x10
+glyph (24):  u16 cp, x, y, w, h | s16 xoff, yoff | u16 adv | u64 ->kern record {u64 ->pairs, u32 n, u32 0}
+pair (4):    u16 cp2 | s16 amount
+texture desc (0x60): +0x28 u16 w,h | +0x2f u8 mips | +0x30 u32 size | +0x34 u32 format (0x00492001 = R8)
+                     | +0x38 u64 ->pixels (second KNLI list)
+texture: R8 SDF, 128 = edge, value = 128 + d * 142 / spread (d in virtual px), full mip chain, rows bottom-up
+```
+New glyph tables are appended to the end of the text section, the texture section is rebuilt when an atlas
+grows, and the KNLI relocation stream, section table, memory-segment records and ` DIC` footer are updated.
+
+---
+
 ## Supported Languages (27 Languages)
 
 | Code     | Language              | Default File Name            |
@@ -368,6 +597,42 @@ Açılmış klasörü [got_psarc_tool](https://github.com/mstww/Ghost-of-Tsushim
 ```powershell
 .\got_psarc_tool.exe pack gapack_misc_l gapack_misc_l.psarc
 ```
+
+### 7. Fontlar: Eksik Harfler, Font Değiştirme, Logo (`got_font_tool`)
+
+Oyun fontları her dil dosyasının (`lang_<dil>_text.xpps`) içindedir. `got_font_tool.exe` dosyasına çift
+tıklayınca grafik arayüz açılır (**Language → Türkçe** ile arayüz Türkçe olur). `.xpps` dosyasını exe'nin üzerine
+bırakarak da açabilirsiniz.
+
+**Önerilen akış** — fontları bir kez orijinal dosya üzerinde düzenleyin, sonra metin repack'lerinde şablon olarak
+bu dosyayı kullanın:
+```powershell
+# eksik harfleri göster
+.\got_font_tool.exe list lang_turkish_text.xpps.bak --from-json turkce_ceviri.json
+# eksik harfleri bir TTF/OTF'den tüm fontlara ekle (boyut, taban çizgisi ve kerning otomatik)
+.\got_font_tool.exe add lang_turkish_text.xpps.bak --ttf Font.ttf --from-json turkce_ceviri.json --kern -o lang_turkish_text.fonts.xpps
+# metni bu dosyayı şablon alarak paketle (çeviri her değiştiğinde yalnızca bu adım)
+.\xpps_tool.exe repack turkce_ceviri.json -t lang_turkish_text.fonts.xpps -o gapack_misc_l\lang_turkish_text.xpps
+```
+
+**Arayüzde neler var?**
+* **Önizleme:** yazdığınız metni ya da `strings.json` içinden seçtiğiniz satırı oyunun fontuyla gösterir.
+  *Koyu arka plan*, *BÜYÜK HARF (ana menü)*, *Glif kutuları* ve *Tüm fontlar* seçenekleri vardır. Fontta olmayan
+  karakterler kırmızıyla listelenir (oyunda boş kutu olarak görünürler).
+* **Glifler:** tüm glifler ızgara hâlinde; arama (`ğüşİ` ya da `U+2605`), tıklayınca büyük görünüm, Unicode adı,
+  kerning çiftleri. *İlerleme / X kayması / Y kayması* değiştirilip **Uygula** ile aralık düzeltilir, **Glifi sil**.
+* **Atlas:** fontun SDF dokusu; bir glife tıklayınca Glifler sekmesinde açılır.
+* **Eksik karakterler:** çevirinizi yapıştırın veya `strings.json` yükleyin, **Kontrol et** — her font için eksik
+  harfler. **Eksik karakterleri TTF'den ekle…** bu harflerle doldurulmuş ekleme penceresini açar.
+* **TTF/OTF'den glif ekle / Fontu değiştir:** font dosyası (`C:\Windows\Fonts` açılır), karakterler, hedef fontlar,
+  kerning, boyut çarpanı ve taban çizgisi kaydırma.
+* **Resimden glif (logo/ikon):** şeffaf arka planlı PNG'yi bir karaktere (örn. `★` = `U+2605`) koyar; sonra bu
+  karakteri çeviride kullanın: `"Destan Moduna Gir ★"`. Özel kullanım alanını (U+E000–U+F8FF) kullanmayın, orası
+  buton ikonlarına ait.
+* **Farklı kaydet** dosyayı yazar ve doğrular; **Geri al** son 4 işlemi geri alır.
+
+**Dikkat:** ana menü yazıları "Ana menü (büyük harf)" fontunu, altyazılar "Metin" fontunu, menüler "Arayüz"
+fontlarını kullanır — emin değilseniz karakteri tüm fontlara ekleyin. Buton ikonları fontu düzenlenemez.
 
 ---
 
