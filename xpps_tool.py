@@ -236,34 +236,27 @@ def repack_xpps(template_path, new_strings, output_path):
 
     desc_pos, t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = res
 
-    new_pool = bytearray()
-    offset_map = {}
-
-    def get_offset(text):
-        enc = text.encode('utf-8') + b'\x00'
-        if enc not in offset_map:
-            offset_map[enc] = len(new_pool)
-            new_pool.extend(enc)
-        return offset_map[enc]
-
     new_sec_data = bytearray(sec_data)
 
-    # Collect and assign offsets for Table 1 (UI strings)
+    # Detect modified strings
     t1_start = t1_ptr - sec_start
-    t1_ptrs = []
+    t3_start = t3_ptr - sec_start
+
+    modified_entries = {}
+    orig_map = {}
+
     for i in range(t1_cnt):
         off = t1_start + i * 16
         if off + 16 > len(sec_data):
             break
         h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
         h_hex = f"{h:016x}"
-        text = new_strings.get(h_hex, _read_cstr(bytes(sec_data), s_off - sec_start))
-        rel_p = get_offset(text)
-        t1_ptrs.append((off + 8, rel_p))
+        p = s_off - sec_start
+        orig_text = _read_cstr(bytes(sec_data), p) if 0 <= p < len(sec_data) else ''
+        orig_map[h_hex] = (orig_text, s_off, off + 8, 1)
+        if h_hex in new_strings and new_strings[h_hex] != orig_text:
+            modified_entries[h_hex] = (new_strings[h_hex], orig_text, s_off, off + 8, 1)
 
-    # Collect and assign offsets for Table 3 (Dialogue cues)
-    t3_start = t3_ptr - sec_start
-    t3_ptrs = []
     for i in range(t3_cnt):
         off = t3_start + i * 24
         if off + 24 > len(sec_data):
@@ -271,32 +264,108 @@ def repack_xpps(template_path, new_strings, output_path):
         h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
         h_hex = f"{h:016x}"
         sub_start = sub_p - sec_start
-        if h_hex in new_strings:
-            for j in range(int(sub_cnt)):
-                se_off = sub_start + j * 16
-                if 0 <= se_off + 16 <= len(sec_data):
-                    txt = new_strings[h_hex] if j == 0 else ""
-                    rel_p = get_offset(txt)
-                    t3_ptrs.append((se_off + 8, rel_p))
+        parts = []
+        for j in range(int(sub_cnt)):
+            se_off = sub_start + j * 16
+            if 0 <= se_off + 16 <= len(sec_data):
+                sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
+                p = s_off - sec_start
+                if 0 <= p < len(sec_data):
+                    parts.append(_read_cstr(bytes(sec_data), p).strip())
+        orig_combined = ' '.join(p for p in parts if p)
+        orig_map[h_hex] = (orig_combined, 0, sub_start, 3, int(sub_cnt))
+        if h_hex in new_strings and new_strings[h_hex] != orig_combined:
+            modified_entries[h_hex] = (new_strings[h_hex], orig_combined, 0, sub_start, 3, int(sub_cnt))
+
+    # Collect duplicate slots for reallocation (85,000+ bytes available)
+    by_text = {}
+    for i in range(t1_cnt):
+        off = t1_start + i * 16
+        if off + 16 > len(sec_data):
+            break
+        h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
+        p = s_off - sec_start
+        txt = _read_cstr(bytes(sec_data), p)
+        if txt not in by_text:
+            by_text[txt] = []
+        by_text[txt].append((off + 8, p, 1))
+
+    for i in range(t3_cnt):
+        off = t3_start + i * 24
+        if off + 24 > len(sec_data):
+            break
+        h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
+        sub_start = sub_p - sec_start
+        for j in range(int(sub_cnt)):
+            se_off = sub_start + j * 16
+            if 0 <= se_off + 16 <= len(sec_data):
+                sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
+                p = s_off - sec_start
+                txt = _read_cstr(bytes(sec_data), p)
+                if txt not in by_text:
+                    by_text[txt] = []
+                by_text[txt].append((se_off + 8, p, 3))
+
+    reusable_slots = []
+    for txt, occs in by_text.items():
+        if len(occs) > 1:
+            first_ptr_loc, first_p, _ = occs[0]
+            for ptr_loc, p, _ in occs[1:]:
+                if p != first_p:
+                    enc_len = len(txt.encode('utf-8')) + 1
+                    reusable_slots.append({'offset': p, 'len': enc_len, 'ptr_loc': ptr_loc, 'first_p': first_p})
+
+    # Try in-place / slot allocation first (100% safe, zero layout shifts)
+    unique_new = sorted(set(v[0] for v in modified_entries.values()), key=lambda x: len(x.encode('utf-8')) + 1, reverse=True)
+    allocated_slots = {}
+    used_slot_indices = set()
+    all_fit = True
+
+    for txt in unique_new:
+        need_len = len(txt.encode('utf-8')) + 1
+        best_idx = None
+        best_len = 10**9
+        for idx, s in enumerate(reusable_slots):
+            if idx not in used_slot_indices and s['len'] >= need_len and s['len'] < best_len:
+                best_idx = idx
+                best_len = s['len']
+        if best_idx is not None:
+            used_slot_indices.add(best_idx)
+            allocated_slots[txt] = reusable_slots[best_idx]
         else:
-            for j in range(int(sub_cnt)):
-                se_off = sub_start + j * 16
-                if 0 <= se_off + 16 <= len(sec_data):
-                    sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
-                    txt = _read_cstr(bytes(sec_data), s_off - sec_start)
-                    rel_p = get_offset(txt)
-                    t3_ptrs.append((se_off + 8, rel_p))
+            all_fit = False
+            break
 
-    if len(new_pool) <= desc_pos:
-        # In-pool engine: string pool fits within original boundary (84KB free space)
-        # Guarantees zero relocation breakdown, zero header shifts, 100% game compatibility
-        for ptr_off, rel_p in t1_ptrs:
-            struct.pack_into('<Q', new_sec_data, ptr_off, sec_start + rel_p)
-        for ptr_off, rel_p in t3_ptrs:
-            struct.pack_into('<Q', new_sec_data, ptr_off, sec_start + rel_p)
+    if all_fit:
+        # Repoint duplicate entries pointing to used slots
+        for idx in used_slot_indices:
+            slot = reusable_slots[idx]
+            struct.pack_into('<Q', new_sec_data, slot['ptr_loc'], sec_start + slot['first_p'])
 
-        pad = desc_pos - len(new_pool)
-        new_sec_data[:desc_pos] = new_pool + b'\x00' * pad
+        # Write new strings into allocated slots
+        text_to_p = {}
+        for txt, slot in allocated_slots.items():
+            enc = txt.encode('utf-8') + b'\x00'
+            p = slot['offset']
+            new_sec_data[p : p + len(enc)] = enc
+            text_to_p[txt] = p
+
+        # Update Table 1 and Table 3 pointers
+        for h_hex, info in modified_entries.items():
+            new_txt = info[0]
+            slot_p = text_to_p[new_txt]
+            tbl = info[4]
+            if tbl == 1:
+                ptr_loc = info[3]
+                struct.pack_into('<Q', new_sec_data, ptr_loc, sec_start + slot_p)
+            elif tbl == 3:
+                sub_start = info[3]
+                sub_cnt = info[5]
+                for j in range(sub_cnt):
+                    se_off = sub_start + j * 16
+                    if j == 0:
+                        struct.pack_into('<Q', new_sec_data, se_off + 8, sec_start + slot_p)
+
         out_data = bytes(data[:sec_abs]) + bytes(new_sec_data) + bytes(data[sec_abs + sec_size:])
     else:
         # Expanded engine: string pool exceeds original boundary
