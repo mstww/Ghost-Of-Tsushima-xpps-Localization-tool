@@ -512,17 +512,16 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
             rel_tbl_p = ptr_loc - desc_pos
             struct.pack_into('<Q', tables_block, rel_tbl_p, sec_start + new_off)
 
-        # 2. Update KNLI tail_bytes pointers
-        # In KNLI bytecode tail, the 7 Section 0 root pointers appear as (orig_ptr + 16)
-        s0_rel_offs = [0x010, 0x020, 0x030, 0x040, 0x050, 0x060, 0x068]
-        for p_off in s0_rel_offs:
-            orig_ptr = struct.unpack('<I', data[hdr_size + p_off : hdr_size + p_off + 4])[0]
-            tv = orig_ptr + 16
-            enc = struct.pack('<I', tv)
-            pos = tail_bytes.find(enc)
-            while pos != -1:
-                struct.pack_into('<I', tail_bytes, pos, tv + delta)
-                pos = tail_bytes.find(enc, pos + 4)
+        # 2. Update KNLI tail_body (fixed 216-byte footer structure in all official files)
+        # In all official game files, the KNLI tail body is exactly 216 bytes starting
+        # with 0x00000270 and ending with b'\\x29\\x7E\\x4C\\x1A\\xBD\\x00\\xB5\\x70 DNE\\x00\\x00\\x00\\x00'.
+        # The 7 Section 0 root pointers (+16) are located at exact fixed offsets:
+        # [16, 48, 80, 112, 144, 176, 192]
+        tail_body = bytearray(knli_orig[-216:])
+        tail_ptr_offsets = [16, 48, 80, 112, 144, 176, 192]
+        for toff in tail_ptr_offsets:
+            old_val = struct.unpack('<I', bytes(tail_body[toff : toff + 4]))[0]
+            struct.pack_into('<I', tail_body, toff, old_val + delta)
 
         new_s6_data = new_pool + tables_block
         pad_s6 = (16 - (len(new_s6_data) % 16)) % 16
@@ -535,12 +534,13 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
         # 3. Update Section 0 root pointers and Section 1..6 font data pointers
         new_hdr_payload = bytearray(data[hdr_size : hdr_size + sec_start])
 
-        # Shift all 7 Section 0 root pointers (0x1F4..0x24C) by delta:
+        # Shift all 7 Section 0 root pointers (payload 0x010..0x068) by delta:
+        s0_rel_offs = [0x010, 0x020, 0x030, 0x040, 0x050, 0x060, 0x068]
         for p_off in s0_rel_offs:
             val = struct.unpack('<I', new_hdr_payload[p_off : p_off + 4])[0]
             struct.pack_into('<I', new_hdr_payload, p_off, val + delta)
 
-        # Shift the 6 Section 1..6 font data pointers in KNLI relocations:
+        # Shift the 6 Section 1..6 font data pointers (these point into Section 8):
         for r in orig_relocs:
             if r < sec_start:
                 val = struct.unpack('<I', bytes(new_hdr_payload[r:r+4]))[0]
@@ -566,11 +566,15 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
             words_enc.append(w)
 
         knli_stream = struct.pack(f'<{len(words_enc)}H', *words_enc)
-        knli_payload = knli_stream + tail_bytes
-        pad_knli = (16 - (len(knli_payload) % 16)) % 16
-        knli_payload += b'\x00' * pad_knli
+        # Alignment preamble between knli_stream and tail_body
+        # Total KNLI: 32 (header) + len(knli_stream) + preamble + 216 (tail_body)
+        # Since (32 + 216) = 248 is a multiple of 8, preamble = (8 - (len(knli_stream) % 8)) % 8
+        preamble_len = (8 - (len(knli_stream) % 8)) % 8
+        knli_payload = knli_stream + (b'\x00' * preamble_len) + tail_body
         new_knli_size = 32 + len(knli_payload)
-        new_knli_hdr = struct.pack('<IIIIIIII', magic, new_knli_size - 16, ver, 0, len(new_relocs), u1, u2, u3)
+        # In all 27 official languages, comp_size = s9_size - 240
+        new_comp_size = new_knli_size - 240
+        new_knli_hdr = struct.pack('<IIIIIIII', magic, new_comp_size, ver, 0, len(new_relocs), u1, u2, u3)
         new_knli = new_knli_hdr + knli_payload
 
         sec1_flags, sec1_size, sec1_offset = struct.unpack('<III', bytes(data[hdr_size - 40: hdr_size - 28]))
