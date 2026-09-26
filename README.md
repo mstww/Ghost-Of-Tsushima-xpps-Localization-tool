@@ -327,7 +327,7 @@ Ghost of Tsushima uses Sucker Punch Productions' proprietary **KCAP** archive fo
 
 ## Türkçe Yerelleştirme ve Çeviri Rehberi
 
-Ghost of Tsushima Director's Cut için kendi Türkçe yamanızı yapmak veya mevcut çevirileri düzenlemek için tam adımlar:
+Ghost of Tsushima Director's Cut için kendi yamanızı yapmak veya mevcut çevirileri düzenlemek için tam adımlar:
 
 ### 1. Ön Hazırlık (.psarc Dosyalarını Açma)
 `.xpps` dil dosyaları oyunun `cache_pc/psarc/` klasöründeki `l` harfiyle başlayan `.psarc` arşivlerinin içindedir.
