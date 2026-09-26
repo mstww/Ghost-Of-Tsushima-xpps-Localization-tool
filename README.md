@@ -4,10 +4,31 @@
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Languages](https://img.shields.io/badge/supported%20languages-27-orange)
-![Release](https://img.shields.io/badge/release-v2.2-brightgreen)
+![Release](https://img.shields.io/badge/release-v3.0-brightgreen)
 
 A dedicated game localization, translation, and modding utility for **Ghost of Tsushima Director's Cut**.
 Extract game text from proprietary KCAP `.xpps` binary localization files into easily editable JSON, translate strings, inspect changes with built-in diffing, and repack them back into game-ready `.xpps` files.
+
+
+> **v3.0 — repack engine rewritten.** The v2.x "dynamic relocation" mode produced broken files as soon as the
+> text no longer fit the original pool: it read the KNLI reloc count as a pointer count (so padding and the
+> ` DIC` footer were re-encoded as garbage relocations), it did not move the root object that owns the text
+> descriptor (payload slot `0x68`), and it hard-coded a 208-byte KNLI footer (wrong for ar/ja/zh files).
+> v3.0 keeps the original string pool untouched, appends new text after it, shifts everything behind it by one
+> 4 KiB-aligned delta and rewrites every pointer from the decoded relocation list. Repacking without changes is
+> bit-identical to the original, and every repack is verified structurally before it is written
+> (`xpps_tool verify` can check any file). Multi-part subtitles can be edited per line with
+> `extract --parts-as-list`. **Always use the untouched original `.xpps` as `-t` template.**
+>
+> **Timed subtitle lines.** Table-3 entries are split into lines, each with its own on-screen time window
+> (the line's sub-hash encodes `end << 16 | start`). A space-joined text is mapped back onto those lines by
+> word alignment with the original (edited/added words stay on their own line), so nothing slides into the
+> next line's time slot. For a completely re-written line set, run
+> `xpps_tool to-list strings.json -t original.xpps` and check/adjust the per-line lists by hand.
+>
+> **Layout strings are protected.** 55 Table-1 strings are empty or whitespace-only (`""`, `" "`, `"\n"`, …). The
+> game inserts them between other texts (e.g. after a subtitle line), so writing text into them makes that text
+> show up next to unrelated lines. `repack` keeps them unchanged and warns; `--allow-blank` overrides.
 
 ---
 
@@ -17,12 +38,15 @@ In a standard Ghost of Tsushima PC installation, `.xpps` localization files are 
 `<GameDirectory>/cache_pc/psarc/` (specifically archive files starting with `l`, such as language audio/text archives).
 
 ### How to get the `.xpps` files:
-1. Download **GoTExtractor** by Glumboi from Nexus Mods:  
-   👉 **[GoTExtractor on Nexus Mods (Mod #65)](https://www.nexusmods.com/ghostoftsushima/mods/65)**
-2. Use GoTExtractor to unpack the target `.psarc` archive from `cache_pc/psarc/` (gapack_misc_l.psarc).
+1. Download the companion **Ghost of Tsushima PSARC / DSAR Tool**:  
+   👉 **[https://github.com/mstww/Ghost-of-Tsushima-PSARC-Tool](https://github.com/mstww/Ghost-of-Tsushima-PSARC-Tool)**
+2. **Back up** `cache_pc/psarc/gapack_misc_l.psarc`, then unpack it:
+   `got_psarc_tool.exe unpack gapack_misc_l.psarc` (or drag the archive onto `got_psarc_tool.exe`).
 3. Once unpacked, you will have the raw `.xpps` files (e.g. `lang_english_text.xpps`, `lang_turkish_text.xpps`, etc.).
+   Keep an untouched copy of the file you translate (e.g. `lang_turkish_text.xpps.bak`) — it is the repack template.
 4. Use this tool (**`xpps_tool`**) to extract, edit, translate, and repack the `.xpps` text files.
-5. Finally, use GoTExtractor to repack the modified `.xpps` back into `.psarc` or place it in your game's mod directory.
+5. Put the repacked `.xpps` into the unpacked folder and rebuild the archive with
+   `got_psarc_tool.exe pack gapack_misc_l` (or drag the folder onto `got_psarc_tool.exe`).
 
 ---
 
@@ -33,7 +57,7 @@ In a standard Ghost of Tsushima PC installation, `.xpps` localization files are 
   - [Option A: Standalone Executable (No Python Required)](#option-a-standalone-executable-no-python-required)
   - [Option B: Python Script](#option-b-python-script)
 - [Complete Modding & Translation Workflow](#complete-modding--translation-workflow)
-  - [Step 0: Unpack `.psarc` with GoTExtractor](#step-0-unpack-psarc-with-gotextractor)
+  - [Step 0: Unpack `.psarc` with got_psarc_tool](#step-0-unpack-psarc-with-got_psarc_tool)
   - [Step 1: Extract Strings to JSON with `xpps_tool`](#step-1-extract-strings-to-json-with-xpps_tool)
   - [Step 2: Translate & Edit](#step-2-translate--edit)
   - [Step 3: Track Translation Progress (`diff`)](#step-3-track-translation-progress-diff)
@@ -95,7 +119,7 @@ python xpps_tool.py --help
        ▼
  [cache_pc/psarc/gapack_misc_l.psarc]
        │
-       │  (Unpack with GoTExtractor - NexusMods #65)
+       │  (Unpack with got_psarc_tool unpack)
        ▼
  [lang_*_text.xpps]
        │
@@ -107,15 +131,19 @@ python xpps_tool.py --help
        ▼
  [lang_*_text.xpps]  (Repack with xpps_tool repack)
        │
-       │  (Repack with GoTExtractor or place in mods folder)
+       │  (Repack with got_psarc_tool pack)
        ▼
 [Ready to Play in Game!]
 ```
 
-### Step 0: Unpack `.psarc` with GoTExtractor
-1. Install [GoTExtractor (Nexus Mods #65)](https://www.nexusmods.com/ghostoftsushima/mods/65).
-2. Open GoTExtractor and extract the language archive (e.g. archive starting with `l` in `cache_pc/psarc/`).
-3. You will obtain the `.xpps` files (e.g. `lang_english_text.xpps`, `lang_turkish_text.xpps`).
+### Step 0: Unpack `.psarc` with got_psarc_tool
+1. Download [Ghost of Tsushima PSARC / DSAR Tool](https://github.com/mstww/Ghost-of-Tsushima-PSARC-Tool).
+2. Back up and unpack the language archive:
+   ```bash
+   copy gapack_misc_l.psarc gapack_misc_l.psarc.orig
+   got_psarc_tool.exe unpack gapack_misc_l.psarc
+   ```
+3. You will obtain the `.xpps` files (e.g. `lang_english_text.xpps`, `lang_turkish_text.xpps`) plus a `Filenames.txt` used for repacking.
 
 ### Step 1: Extract Strings to JSON with `xpps_tool`
 Extract text from your target language file (e.g. English as a base, or Turkish):
@@ -171,12 +199,17 @@ Sample Modified Strings (first 5):
 ### Step 4: Repack into `.xpps`
 Rebuild the game-ready `.xpps` file using the original file as a binary template:
 ```bash
-xpps_tool.exe repack my_turkish_translation.json -t lang_english_text.xpps -o lang_turkish_text.xpps
+xpps_tool.exe repack my_turkish_translation.json -t lang_turkish_text.xpps.bak -o gapack_misc_l\lang_turkish_text.xpps
 ```
-The tool will automatically verify that the string count and binary invariants match the template.
+Always use the **untouched original** file of the same language as template (`-t`). The output is verified
+structurally against it before it is written.
 
 ### Step 5: Pack Back into Game
-Repack the modified `.xpps` back into `.psarc` using **GoTExtractor**, or install it using your preferred Ghost of Tsushima mod manager.
+Rebuild the archive with [got_psarc_tool](https://github.com/mstww/Ghost-of-Tsushima-PSARC-Tool) and copy it back to `cache_pc/psarc/`:
+```bash
+got_psarc_tool.exe pack gapack_misc_l gapack_misc_l.psarc
+```
+Only files listed in `Filenames.txt` are packed, with the same layout as the original game archive.
 
 ---
 
@@ -285,7 +318,7 @@ Ghost of Tsushima uses Sucker Punch Productions' proprietary **KCAP** archive fo
   Tail: Format Descriptors & Engine Type Registrations
 ```
 
-### Why Naive Repacking Broke Games & How v2.2 Solves It
+### Why Naive Repacking Broke Games (see the v3.0 note at the top for what changed)
 1. **Engine Bounds Invariant**: The engine validates that every string pointer falls strictly inside `0 .. desc_pos`. In v2.2, all strings are positioned within this boundary and `desc_pos` dynamically expands.
 2. **KNLI Relocation Bytecode**: When loaded into RAM, the engine traverses the KNLI stream and rebases every 64-bit pointer (`*(uint64_t*)(base + offset) += base`). If string expansion moves tables without updating KNLI, the engine rebases random memory, resulting in instant crashes.
 3. **15-Bit Window Relocation Encoding**: `xpps_tool` v2.2 includes the world's first complete encoder/decoder for KNLI bytecode, recalculating all 63,400+ relocation pointers so that file size can grow to **2x, 5x, or 10x** seamlessly without crashing.
@@ -298,10 +331,12 @@ Ghost of Tsushima Director's Cut için kendi Türkçe yamanızı yapmak veya mev
 
 ### 1. Ön Hazırlık (.psarc Dosyalarını Açma)
 `.xpps` dil dosyaları oyunun `cache_pc/psarc/` klasöründeki `l` harfiyle başlayan `.psarc` arşivlerinin içindedir.
-1. Nexus Mods'tan **GoTExtractor** aracını indirin:  
-   👉 **[GoTExtractor (Nexus Mods #65)](https://www.nexusmods.com/ghostoftsushima/mods/65)**
-2. GoTExtractor ile `cache_pc/psarc/` içindeki dil arşivini (örneğin `gapack_misc_l.psarc`) dışarı çıkarın.
-3. Böylece `lang_turkish_text.xpps` dosyasını elde edeceksiniz.
+1. **Ghost of Tsushima PSARC / DSAR Tool** aracını indirin:  
+   👉 **[https://github.com/mstww/Ghost-of-Tsushima-PSARC-Tool](https://github.com/mstww/Ghost-of-Tsushima-PSARC-Tool)**
+2. `cache_pc/psarc/gapack_misc_l.psarc` dosyasının yedeğini alın ve açın:
+   `got_psarc_tool.exe unpack gapack_misc_l.psarc` (veya arşivi `got_psarc_tool.exe` üzerine sürükleyin).
+3. Böylece `lang_turkish_text.xpps` dosyasını elde edeceksiniz. Bu dosyanın dokunulmamış bir kopyasını
+   (`lang_turkish_text.xpps.bak`) saklayın; repack için şablon olarak o kullanılacak.
 
 ### 2. Metinleri JSON Olarak Dışa Aktarma
 ```powershell
@@ -315,7 +350,7 @@ JSON dosyasını VS Code veya Notepad++ ile açın. Sol taraftaki 16 haneli hex 
 "8bc3029abeb1b9a2": "Başlamak için  düğmesine bas"
 ```
 > [!NOTE]
-> `xpps_tool` v2.2 ile artık **metin uzunluğu veya karakter sınırı tamamen kaldırılmıştır**. Çeviriniz orijinalden 2 kat, 5 kat daha uzun olsa bile Dinamik Relokasyon Motoru sayesinde oyun çökmeden sorunsuz yüklenir.
+> `xpps_tool` v3.0 ile **metin uzunluğu sınırı yoktur**. Orijinal metin havuzu korunur, yeni metin sonuna eklenir ve tüm pointer'lar relokasyon tablosundan yeniden yazılır. Çok satırlı altyazılar orijinal satır sınırlarına göre bölünür; satırları elle ayarlamak için `to-list` komutunu kullanın. Orijinalde boş olan metinler (`""`, `"\n"` …) korunur.
 
 ### 4. Çeviri İlerlemesini Kontrol Etme
 ```powershell
@@ -325,11 +360,14 @@ Bu komut kaç satırın çevrildiğini, yüzde kaç tamamlandığını ve örnek
 
 ### 5. Oyuna Uygun Hale Getirme (Repack)
 ```powershell
-.\xpps_tool.exe repack turkce_ceviri.json -t lang_turkish_text.xpps -o lang_turkish_text.xpps
+.\xpps_tool.exe repack turkce_ceviri.json -t lang_turkish_text.xpps.bak -o gapack_misc_l\lang_turkish_text.xpps
 ```
 
 ### 6. Oyuna Yükleme
-Ürettiğiniz `lang_turkish_text.xpps` dosyasını GoTExtractor ile tekrar `.psarc` içine paketleyin veya oyunun mod klasörüne ekleyin.
+Açılmış klasörü [got_psarc_tool](https://github.com/mstww/Ghost-of-Tsushima-PSARC-Tool) ile tekrar paketleyin ve `cache_pc/psarc/` içine kopyalayın:
+```powershell
+.\got_psarc_tool.exe pack gapack_misc_l gapack_misc_l.psarc
+```
 
 ---
 

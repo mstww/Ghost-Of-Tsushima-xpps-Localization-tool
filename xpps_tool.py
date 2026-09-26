@@ -1,21 +1,42 @@
 #!/usr/bin/env python3
 """
-xpps_tool.py - Ghost of Tsushima Localization Tool (v2.2)
+xpps_tool.py - Ghost of Tsushima Localization Tool (v3.0)
 
-A translation and modding utility for Ghost of Tsushima Director's Cut.
-Extracts game text from proprietary KCAP .xpps localization files into editable JSON,
-repacks translated text back into game-ready .xpps files, and provides translation diff/progress tools.
+Extracts game text from KCAP .xpps localization files (lang_*_text.xpps) into
+editable JSON and rebuilds game-ready .xpps files from translated JSON.
 
 Commands
 --------
   extract  -- Extract localization text from .xpps file(s) into editable JSON
-  repack   -- Rebuild a .xpps file from modified translation JSON using a template
-  diff     -- Compare two localization files and check translation progress
+  repack   -- Rebuild a .xpps file from translated JSON using the original as template
+  verify   -- Structurally check a repacked .xpps against its original template
+  to-list  -- Turn joined multi-line subtitles in a JSON into per-line lists
+  diff     -- Compare two localization files and report translation progress
+
+v3.0 rewrite of the repack engine
+---------------------------------
+Earlier versions patched the file with hard-coded offsets. The KNLI relocation
+table was decoded incorrectly (the reloc count was treated as a pointer count,
+so padding and the " DIC" footer were read as relocations and written back as
+garbage fix-ups), the root object of the text table was not moved, and the
+KNLI footer size was hard-coded to 208 bytes (wrong for ar/ja/zh files). Any
+translation that did not fit in the old string pool therefore produced a
+broken file.
+
+The new engine is layout-preserving:
+  * The original string pool is kept byte-for-byte; new/changed strings are
+    appended after it, so every untouched pointer stays valid.
+  * Everything after the pool (tables, font data, KNLI) is shifted by one
+    4 KiB-aligned delta, and every pointer is rewritten from the KNLI
+    relocation list (decoded and re-encoded exactly; round-trip is checked).
+  * Header section sizes/offsets and the KNLI " DIC" footer are updated.
+  * Repacking with no changes reproduces the template bit-for-bit.
+  * After every repack the output is verified structurally against the
+    template (every relocation, every non-pointer byte, every string).
 """
 
 import os
 import sys
-import glob
 import struct
 import json
 import re
@@ -28,9 +49,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     except Exception:
         pass
 
-# ---------------------------------------------------------------------------
-# Language mappings for Ghost of Tsushima localization files
-# ---------------------------------------------------------------------------
+VERSION = '3.0'
 
 LANG_MAP = {
     'lang_arabic_text.xpps':    'ar',
@@ -54,7 +73,7 @@ LANG_MAP = {
     'lang_latino_text.xpps':    'es-mx',
     'lang_norwegian_text.xpps': 'no',
     'lang_polish_text.xpps':    'pl',
-    'lang_portuguese_text.xpps':'pt',
+    'lang_portuguese_text.xpps': 'pt',
     'lang_russian_text.xpps':   'ru',
     'lang_spanish_text.xpps':   'es',
     'lang_swedish_text.xpps':   'sv',
@@ -62,14 +81,15 @@ LANG_MAP = {
     'lang_turkish_text.xpps':   'tr',
 }
 
-CODE_TO_FILE = {code: fn for fn, code in LANG_MAP.items()}
+PUA_PATTERN = re.compile(r'[-]')
 
-PUA_PATTERN = re.compile(r'[\ue000-\uf8ff]')
+KNLI_STREAM_OFF = 0x1c      # relocation word stream starts inside the KNLI header
+POOL_ALIGN = 0x1000         # everything after the string pool moves by a multiple of this
 
 
-# ---------------------------------------------------------------------------
-# Binary Helpers
-# ---------------------------------------------------------------------------
+class XppsError(Exception):
+    pass
+
 
 def strip_pua(text):
     """Strip Unicode Private Use Area gamepad button icons and collapse spaces."""
@@ -78,883 +98,788 @@ def strip_pua(text):
 
 
 def _read_cstr(data, offset):
-    """Read a null-terminated UTF-8 string from byte array at offset."""
     end = data.find(b'\x00', offset)
     if end == -1:
         end = len(data)
     return data[offset:end].decode('utf-8', errors='replace')
 
 
+def _u64(buf, off):
+    return struct.unpack_from('<Q', buf, off)[0]
+
+
+# ---------------------------------------------------------------------------
+# KNLI relocation stream
+# ---------------------------------------------------------------------------
+#   0xC000 | p   -> select page p (page = 0x8000 dwords = 128 KiB)
+#   0x8000 | n   -> n more relocations, each 8 bytes after the previous one
+#   w < 0x8000   -> relocation at byte offset (page * 0x8000 + w) * 4
+# Every relocation is a 64-bit pointer, relative to the payload start.
+# header.count == number_of_words_from_0x1c - header.u6 (true for all 27 languages)
+
+def decode_relocs(words):
+    """Returns list of ops: ('rel', loc) or ('run', n, [locs])."""
+    ops = []
+    page = 0
+    last = None
+    for w in words:
+        if (w & 0xC000) == 0xC000:
+            page = w & 0x3FFF
+        elif w & 0x8000:
+            n = w & 0x3FFF
+            if last is None:
+                raise XppsError('KNLI: run op before any relocation')
+            locs = [last + 8 * (k + 1) for k in range(n)]
+            ops.append(('run', n, locs))
+            last = locs[-1] if locs else last
+        else:
+            last = (page * 0x8000 + w) * 4
+            ops.append(('rel', last))
+    return ops
+
+
+def encode_relocs(ops):
+    words = []
+    cur_page = None
+    for op in ops:
+        if op[0] == 'rel':
+            loc = op[1]
+            if loc % 4:
+                raise XppsError(f'KNLI: unaligned relocation 0x{loc:x}')
+            dw = loc // 4
+            p, w = divmod(dw, 0x8000)
+            if p > 0x3FFF:
+                raise XppsError('KNLI: relocation beyond 2 GiB')
+            if p != cur_page:
+                words.append(0xC000 | p)
+                cur_page = p
+            words.append(w)
+        else:
+            words.append(0x8000 | op[1])
+    return words
+
+
+def reloc_locations(ops):
+    out = []
+    for op in ops:
+        if op[0] == 'rel':
+            out.append(op[1])
+        else:
+            out.extend(op[2])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Container parser
+# ---------------------------------------------------------------------------
+
 def find_master_descriptor(sec_data, sec_start):
-    """
-    Locate the master descriptor inside the text section using structural invariants.
-    Master descriptor: [t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt]
-    """
-    for p in range(0, len(sec_data) - 48, 8):
-        t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = struct.unpack(
-            '<QQQQQQ', sec_data[p: p + 48])
-        if t1_cnt > 0 and t2_cnt > 0 and t3_cnt > 0:
-            if t1_ptr in (p + sec_start + 72, p + sec_start + 48):
-                if (t2_ptr == t1_ptr + t1_cnt * 16
-                        and t3_ptr == t2_ptr + t2_cnt * 24):
-                    return p, t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt
-
-    # Robust fallback for modified headers
-    for p in range(0, len(sec_data) - 48, 8):
-        t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = struct.unpack(
-            '<QQQQQQ', sec_data[p: p + 48])
-        if t1_cnt > 1000 and t2_cnt > 100 and t3_cnt > 1000:
-            if (t2_ptr == t1_ptr + t1_cnt * 16
-                    and t3_ptr == t2_ptr + t2_cnt * 24):
+    """Master descriptor: [t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt]."""
+    n = len(sec_data) - 48
+    for strict in (True, False):
+        for p in range(0, n, 8):
+            t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = struct.unpack_from('<6Q', sec_data, p)
+            if not (t1_cnt > 0 and t2_cnt > 0 and t3_cnt > 0):
+                continue
+            if strict and t1_ptr not in (p + sec_start + 72, p + sec_start + 48):
+                continue
+            if not strict and not (t1_cnt > 1000 and t3_cnt > 1000):
+                continue
+            if t2_ptr == t1_ptr + t1_cnt * 16 and t3_ptr == t2_ptr + t2_cnt * 24:
                 return p, t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt
-
     return None
 
 
-# ---------------------------------------------------------------------------
-# Extraction Engine
-# ---------------------------------------------------------------------------
+class Xpps:
+    def __init__(self, data, name='<xpps>'):
+        self.data = bytes(data)
+        self.name = name
+        d = self.data
+        if len(d) < 512 or d[:4] != b'KCAP':
+            raise XppsError(f'{name}: not a KCAP .xpps file')
+        H = struct.unpack_from('<I', d, 0x28)[0]
+        self.H = H
+        self.payload_size = struct.unpack_from('<I', d, 0x2c)[0]
+        if H + self.payload_size != len(d):
+            raise XppsError(f'{name}: payload size mismatch')
+        self.P = d[H:]
+        # section triplets (flags, size, offset) for text / font-data / KNLI
+        self.trip_off = {'s6': H - 52, 's7': H - 40, 's8': H - 28}
+        self.s6_flags, self.s6_size, self.s6 = struct.unpack_from('<III', d, H - 52)
+        self.s7_flags, self.s7_size, self.s7 = struct.unpack_from('<III', d, H - 40)
+        self.s8_flags, self.s8_size, self.s8 = struct.unpack_from('<III', d, H - 28)
+        if self.s6 + self.s6_size != self.s7 or self.s7 + self.s7_size != self.s8 \
+                or self.s8 + self.s8_size != self.payload_size:
+            raise XppsError(f'{name}: unexpected section layout')
+        self.S = self.P[self.s6:self.s6 + self.s6_size]
 
-def extract_xpps(file_path, clean_pua=False):
-    """
-    Extracts all localized strings from a Ghost of Tsushima .xpps language file.
+        res = find_master_descriptor(self.S, self.s6)
+        if res is None:
+            raise XppsError(f'{name}: master localization descriptor not found')
+        (self.desc_pos, self.t1_ptr, self.t1_cnt, self.t2_ptr, self.t2_cnt,
+         self.t3_ptr, self.t3_cnt) = res
+        self._parse_knli()
+        self._parse_tables()
 
-    Returns:
-        dict[str, str]: Map of 16-hex hash key to localized string text.
-    """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+    # -- KNLI --------------------------------------------------------------
+    def _parse_knli(self):
+        K = self.P[self.s8:self.s8 + self.s8_size]
+        self.K = K
+        if K[:4] != b'KNLI':
+            raise XppsError(f'{self.name}: KNLI magic not found')
+        (_, self.k_comp, _, _, self.k_count, self.k_u5, self.k_u6) = struct.unpack_from('<7I', K, 0)
+        n_words = self.k_count + self.k_u6
+        end = KNLI_STREAM_OFF + 2 * n_words
+        self.k_words = list(struct.unpack_from(f'<{n_words}H', K, KNLI_STREAM_OFF))
+        dic_off = (end + 7) & ~7
+        if K[dic_off:dic_off + 4] != b' DIC' or self.k_comp != dic_off - 8:
+            raise XppsError(f'{self.name}: KNLI layout not recognised')
+        self.k_dic = K[dic_off:]
+        self.k_ops = decode_relocs(self.k_words)
+        if encode_relocs(self.k_ops) != self.k_words:
+            raise XppsError(f'{self.name}: KNLI stream does not round-trip')
+        self.relocs = reloc_locations(self.k_ops)
 
-    with open(file_path, 'rb') as f:
-        data = f.read()
-
-    if len(data) < 512:
-        raise ValueError(f"File too small to be a valid .xpps archive: {file_path}")
-
-    if data[:4] != b'KCAP':
-        raise ValueError(f"Invalid magic: {data[:4]} (expected b'KCAP') in {file_path}")
-
-    hdr_size = struct.unpack('<I', data[0x28:0x2c])[0]
-    flags, sec_size, sec_start = struct.unpack(
-        '<III', data[hdr_size - 52: hdr_size - 40])
-    sec_data = data[hdr_size + sec_start: hdr_size + sec_start + sec_size]
-
-    res = find_master_descriptor(sec_data, sec_start)
-    if res is None:
-        raise ValueError(f"Master localization descriptor not found in {file_path}")
-
-    desc_pos, t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = res
-
-    entries = {}
-
-    # Table 1: UI, system, skill, quest, and menu strings (16 bytes per entry: hash, string_offset)
-    t1_start = t1_ptr - sec_start
-    for i in range(t1_cnt):
-        off = t1_start + i * 16
-        if off + 16 > len(sec_data):
-            break
-        h, s_off = struct.unpack('<QQ', sec_data[off: off + 16])
-        str_p = s_off - sec_start
-        if 0 <= str_p < len(sec_data):
-            text = _read_cstr(sec_data, str_p)
-            if clean_pua:
-                text = strip_pua(text)
-            entries[f"{h:016x}"] = text
-
-    # Table 3: Dialogue, cutscenes, and subtitle audio cues (24 bytes per entry: hash, sub_ptr, sub_cnt)
-    t3_start = t3_ptr - sec_start
-    for i in range(t3_cnt):
-        off = t3_start + i * 24
-        if off + 24 > len(sec_data):
-            break
-        h, sub_p, sub_cnt = struct.unpack('<QQQ', sec_data[off: off + 24])
-        sub_start = sub_p - sec_start
-        parts = []
-        for j in range(int(sub_cnt)):
-            se_off = sub_start + j * 16
-            if 0 <= se_off + 16 <= len(sec_data):
-                sh, s_off = struct.unpack('<QQ', sec_data[se_off: se_off + 16])
-                str_p = s_off - sec_start
-                if 0 <= str_p < len(sec_data):
-                    part_text = _read_cstr(sec_data, str_p).strip()
-                    if clean_pua:
-                        part_text = strip_pua(part_text)
-                    if part_text:
-                        parts.append(part_text)
-        entries[f"{h:016x}"] = ' '.join(parts)
-
-    return entries
-
-
-# ---------------------------------------------------------------------------
-# Repack Engine
-# ---------------------------------------------------------------------------
-
-def _build_string_blob(strings_ordered):
-    """
-    Build a contiguous UTF-8 string blob (each string null-terminated).
-    Returns: (bytes, offsets_list)
-    """
-    blob = bytearray()
-    offsets = []
-    seen = {}
-    for s in strings_ordered:
-        enc = s.encode('utf-8') + b'\x00'
-        if enc not in seen:
-            seen[enc] = len(blob)
-            blob += enc
-        offsets.append(seen[enc])
-    return bytes(blob), offsets
-
-
-def repack_xpps(template_path, new_strings, output_path, force_expand=False):
-    """
-    Rebuild a .xpps file by replacing string content with `new_strings`
-    while keeping the full KCAP binary structure intact.
-    
-    Supports two modes:
-    1. Duplicate-Slot Allocator: When modifications fit into duplicate string slots (85KB+),
-       keeps 99.996% identical binary layout with zero section/header shifts.
-    2. Dynamic Relocation & KNLI Re-encoding Engine: When translations exceed slot space
-       or force_expand=True, dynamically resizes the string pool, shifts internal descriptors
-       and tables, recalculates Section 7/8 boundaries, and re-encodes the Section 8 KNLI
-       relocation bytecode to support arbitrary file expansions (2x, 5x, 10x size).
-    """
-    if not os.path.exists(template_path):
-        raise FileNotFoundError(f"Template not found: {template_path}")
-    if not new_strings:
-        raise ValueError("new_strings dictionary is empty")
-
-    with open(template_path, 'rb') as f:
-        data = bytearray(f.read())
-
-    if len(data) < 512 or data[:4] != b'KCAP':
-        raise ValueError(f"Not a valid KCAP .xpps file: {template_path}")
-
-    hdr_size = struct.unpack('<I', bytes(data[0x28:0x2c]))[0]
-    flags, sec_size, sec_start = struct.unpack(
-        '<III', bytes(data[hdr_size - 52: hdr_size - 40]))
-
-    sec_abs = hdr_size + sec_start
-    sec_data = bytearray(data[sec_abs: sec_abs + sec_size])
-
-    res = find_master_descriptor(bytes(sec_data), sec_start)
-    if res is None:
-        raise ValueError(f"Master localization descriptor not found in {template_path}")
-
-    desc_pos, t1_ptr, t1_cnt, t2_ptr, t2_cnt, t3_ptr, t3_cnt = res
-
-    new_sec_data = bytearray(sec_data)
-
-    # Detect modified strings
-    t1_start = t1_ptr - sec_start
-    t3_start = t3_ptr - sec_start
-
-    modified_entries = {}
-    orig_map = {}
-
-    for i in range(t1_cnt):
-        off = t1_start + i * 16
-        if off + 16 > len(sec_data):
-            break
-        h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
-        h_hex = f"{h:016x}"
-        p = s_off - sec_start
-        orig_text = _read_cstr(bytes(sec_data), p) if 0 <= p < len(sec_data) else ''
-        orig_map[h_hex] = (orig_text, s_off, off + 8, 1)
-        if h_hex in new_strings and new_strings[h_hex] != orig_text:
-            modified_entries[h_hex] = (new_strings[h_hex], orig_text, s_off, off + 8, 1)
-
-    for i in range(t3_cnt):
-        off = t3_start + i * 24
-        if off + 24 > len(sec_data):
-            break
-        h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
-        h_hex = f"{h:016x}"
-        sub_start = sub_p - sec_start
-        parts = []
-        for j in range(int(sub_cnt)):
-            se_off = sub_start + j * 16
-            if 0 <= se_off + 16 <= len(sec_data):
-                sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
-                p = s_off - sec_start
-                if 0 <= p < len(sec_data):
-                    parts.append(_read_cstr(bytes(sec_data), p).strip())
-        orig_combined = ' '.join(p for p in parts if p)
-        orig_map[h_hex] = (orig_combined, 0, sub_start, 3, int(sub_cnt))
-        if h_hex in new_strings and new_strings[h_hex] != orig_combined:
-            modified_entries[h_hex] = (new_strings[h_hex], orig_combined, 0, sub_start, 3, int(sub_cnt))
-
-    # Collect duplicate slots for reallocation (85,000+ bytes available)
-    by_text = {}
-    for i in range(t1_cnt):
-        off = t1_start + i * 16
-        if off + 16 > len(sec_data):
-            break
-        h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
-        p = s_off - sec_start
-        txt = _read_cstr(bytes(sec_data), p)
-        if txt not in by_text:
-            by_text[txt] = []
-        by_text[txt].append((off + 8, p, 1))
-
-    for i in range(t3_cnt):
-        off = t3_start + i * 24
-        if off + 24 > len(sec_data):
-            break
-        h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
-        sub_start = sub_p - sec_start
-        for j in range(int(sub_cnt)):
-            se_off = sub_start + j * 16
-            if 0 <= se_off + 16 <= len(sec_data):
-                sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
-                p = s_off - sec_start
-                txt = _read_cstr(bytes(sec_data), p)
-                if txt not in by_text:
-                    by_text[txt] = []
-                by_text[txt].append((se_off + 8, p, 3))
-
-    reusable_slots = []
-    for txt, occs in by_text.items():
-        if len(occs) > 1:
-            first_ptr_loc, first_p, _ = occs[0]
-            for ptr_loc, p, _ in occs[1:]:
-                if p != first_p:
-                    enc_len = len(txt.encode('utf-8')) + 1
-                    reusable_slots.append({'offset': p, 'len': enc_len, 'ptr_loc': ptr_loc, 'first_p': first_p})
-
-    # Try in-place / slot allocation first if force_expand is False
-    unique_new = sorted(set(v[0] for v in modified_entries.values()), key=lambda x: len(x.encode('utf-8')) + 1, reverse=True)
-    allocated_slots = {}
-    used_slot_indices = set()
-    all_fit = not force_expand
-
-    if not force_expand:
-        for txt in unique_new:
-            need_len = len(txt.encode('utf-8')) + 1
-            best_idx = None
-            best_len = 10**9
-            for idx, s in enumerate(reusable_slots):
-                if idx not in used_slot_indices and s['len'] >= need_len and s['len'] < best_len:
-                    best_idx = idx
-                    best_len = s['len']
-            if best_idx is not None:
-                used_slot_indices.add(best_idx)
-                allocated_slots[txt] = reusable_slots[best_idx]
-            else:
-                all_fit = False
-                break
-
-    if all_fit:
-        # Mode 1: Duplicate-Slot In-Pool Engine (100% original binary layout, 0 layout shifts)
-        for idx in used_slot_indices:
-            slot = reusable_slots[idx]
-            struct.pack_into('<Q', new_sec_data, slot['ptr_loc'], sec_start + slot['first_p'])
-
-        text_to_p = {}
-        for txt, slot in allocated_slots.items():
-            enc = txt.encode('utf-8') + b'\x00'
-            p = slot['offset']
-            new_sec_data[p : p + len(enc)] = enc
-            text_to_p[txt] = p
-
-        for h_hex, info in modified_entries.items():
-            new_txt = info[0]
-            slot_p = text_to_p[new_txt]
-            tbl = info[4]
-            if tbl == 1:
-                ptr_loc = info[3]
-                struct.pack_into('<Q', new_sec_data, ptr_loc, sec_start + slot_p)
-            elif tbl == 3:
-                sub_start = info[3]
-                sub_cnt = info[5]
-                for j in range(sub_cnt):
-                    se_off = sub_start + j * 16
-                    if j == 0:
-                        struct.pack_into('<Q', new_sec_data, se_off + 8, sec_start + slot_p)
-
-        out_data = bytes(data[:sec_abs]) + bytes(new_sec_data) + bytes(data[sec_abs + sec_size:])
-    else:
-        # Mode 2: Dynamic Relocation & KNLI Re-encoding Engine
-        # Supports arbitrary text length and arbitrary file size expansion (2x, 5x, 10x).
-        flags8, s8_size, s8_off = struct.unpack('<III', bytes(data[hdr_size - 28: hdr_size - 16]))
-        knli_orig = data[hdr_size + s8_off : hdr_size + s8_off + s8_size]
-        magic, comp_size, ver, zero, count, u1, u2, u3 = struct.unpack('<IIIIIIII', bytes(knli_orig[:32]))
-        words = struct.unpack(f'<{len(knli_orig[0x20:]) // 2}H', bytes(knli_orig[0x20 : 0x20 + (len(knli_orig[0x20:]) // 2) * 2]))
-
-        orig_relocs = []
-        page = 0
-        for w in words:
-            if w == 0x800d:
-                continue
-            elif (w & 0xc000) == 0xc000:
-                page = w & 0x3fff
-            elif w < 0x8000:
-                orig_relocs.append(((page * 0x8000) + w) * 4)
-            if len(orig_relocs) == count:
-                break
-
-        i = 0
-        c = 0
-        while i < len(words) and c < count:
-            if words[i] < 0x8000:
-                c += 1
-            i += 1
-        tail_bytes = bytearray(knli_orig[0x20 + i*2 :])
-
-        t1_entries = []
-        for idx in range(t1_cnt):
-            off = t1_start + idx * 16
-            if off + 16 > len(sec_data):
-                break
-            h, s_off = struct.unpack('<QQ', bytes(sec_data[off: off + 16]))
-            h_hex = f'{h:016x}'
-            p = s_off - sec_start
-            orig_text = _read_cstr(bytes(sec_data), p) if 0 <= p < len(sec_data) else ''
-            t1_entries.append((h_hex, s_off, off + 8, orig_text))
-
-        t3_entries = []
-        for idx in range(t3_cnt):
-            off = t3_start + idx * 24
-            if off + 24 > len(sec_data):
-                break
-            h, sub_p, sub_cnt = struct.unpack('<QQQ', bytes(sec_data[off: off + 24]))
-            h_hex = f'{h:016x}'
-            sub_start = sub_p - sec_start
+    # -- text tables -------------------------------------------------------
+    def _parse_tables(self):
+        S, base = self.S, self.s6
+        self.t1 = []     # (hash, ptr_loc_payload, str_off_s6)
+        o = self.t1_ptr - base
+        for i in range(self.t1_cnt):
+            h, v = struct.unpack_from('<QQ', S, o + 16 * i)
+            self.t1.append((h, self.t1_ptr + 16 * i + 8, v - base))
+        self.t3 = []     # (hash, [(sub_hash, ptr_loc_payload, str_off_s6), ...])
+        o = self.t3_ptr - base
+        for i in range(self.t3_cnt):
+            h, sp, sc = struct.unpack_from('<QQQ', S, o + 24 * i)
             parts = []
-            sub_offs = []
-            for j in range(int(sub_cnt)):
-                se_off = sub_start + j * 16
-                if 0 <= se_off + 16 <= len(sec_data):
-                    sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
-                    p = s_off - sec_start
-                    txt = _read_cstr(bytes(sec_data), p).strip() if 0 <= p < len(sec_data) else ''
-                    sub_offs.append((se_off + 8, p, txt))
-                    if txt:
-                        parts.append(txt)
-            t3_entries.append((h_hex, sub_start, int(sub_cnt), ' '.join(parts), sub_offs))
+            for j in range(int(sc)):
+                sh, v = struct.unpack_from('<QQ', S, sp - base + 16 * j)
+                parts.append((sh, sp + 16 * j + 8, v - base))
+            self.t3.append((h, parts))
+        # end of the string pool / start of the tables block
+        str_offs = [s for _, _, s in self.t1] + [s for _, ps in self.t3 for _, _, s in ps]
+        pool_end = 0
+        for s in str_offs:
+            if 0 <= s < self.desc_pos:
+                e = S.index(b'\x00', s) + 1
+                if e > pool_end:
+                    pool_end = e
+        # the first object after the strings (e.g. the root object that owns the
+        # descriptor) marks the beginning of the table block
+        tab = self.desc_pos
+        for loc in self.relocs:
+            v = _u64(self.P, loc)
+            if self.s6 + pool_end <= v < self.s6 + self.desc_pos:
+                tab = min(tab, v - self.s6)
+        if any(S[pool_end:tab]):
+            raise XppsError(f'{self.name}: unexpected data between string pool and tables')
+        self.pool_end = pool_end
+        self.tab_start = tab
 
-        new_pool = bytearray()
-        text_to_pool_offset = {}
+    def text(self, off):
+        return _read_cstr(self.S, off)
 
-        def add_to_pool(text):
-            enc = text.encode('utf-8') + b'\x00'
-            if enc not in text_to_pool_offset:
-                text_to_pool_offset[enc] = len(new_pool)
-                new_pool.extend(enc)
-            return text_to_pool_offset[enc]
+    def strings(self, clean_pua=False, parts_as_list=False):
+        out = {}
+        for h, _, s in self.t1:
+            t = self.text(s)
+            out[f'{h:016x}'] = strip_pua(t) if clean_pua else t
+        for h, parts in self.t3:
+            ps = [self.text(s).strip() for _, _, s in parts]
+            if clean_pua:
+                ps = [strip_pua(p) for p in ps]
+            if parts_as_list and len(parts) > 1:
+                out[f'{h:016x}'] = ps
+            else:
+                out[f'{h:016x}'] = ' '.join(p for p in ps if p)
+        return out
 
-        add_to_pool('')
 
-        t1_new_ptrs = []
-        for h_hex, old_s_off, ptr_loc, orig_text in t1_entries:
-            text = new_strings.get(h_hex, orig_text)
-            new_off = add_to_pool(text)
-            t1_new_ptrs.append((ptr_loc, new_off))
+# ---------------------------------------------------------------------------
+# Extraction
+# ---------------------------------------------------------------------------
 
-        t3_new_ptrs = []
-        for h_hex, sub_start, sub_cnt, orig_text, sub_offs in t3_entries:
-            if h_hex in new_strings and new_strings[h_hex] != orig_text:
-                new_text = new_strings[h_hex]
-                if sub_cnt == 1:
-                    new_off = add_to_pool(new_text)
-                    t3_new_ptrs.append((sub_offs[0][0], new_off))
+def extract_xpps(file_path, clean_pua=False, parts_as_list=False):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f'File not found: {file_path}')
+    with open(file_path, 'rb') as f:
+        x = Xpps(f.read(), file_path)
+    return x.strings(clean_pua=clean_pua, parts_as_list=parts_as_list)
+
+
+# ---------------------------------------------------------------------------
+# Repack
+# ---------------------------------------------------------------------------
+
+_WORD_SPLIT = re.compile(r'[ \t\r\n]+')          # NBSP stays inside a word
+_PUNCT_END = ('.', '!', '?', '\u2026', ',', ';', ':', '"', '\u201d', '\u00bb', ')')
+
+
+def _words(text):
+    return [w for w in _WORD_SPLIT.split(text) if w]
+
+
+def _split_proportional(text, orig_parts):
+    """Fallback for a completely new text: cut into len(orig_parts) lines, following
+    the length ratio of the original lines and preferring cuts after punctuation."""
+    n = len(orig_parts)
+    words = _words(text)
+    if len(words) <= n:
+        return words + [''] * (n - len(words))
+    ends, pos = [], 0                     # char position after each word
+    for w in words:
+        pos += len(w) + 1
+        ends.append(pos)
+    total = ends[-1]
+    weights = [max(1, len(p)) for p in orig_parts]
+    wsum = float(sum(weights))
+    cuts, acc, prev = [], 0.0, -1         # cut after word index
+    for k in range(n - 1):
+        acc += weights[k] / wsum * total
+        lo = prev + 1                             # at least one word per line
+        hi = len(words) - (n - 1 - k) - 1         # leave one word for every later line
+        window = 0.35 * total / n
+        best, best_score = None, None
+        for i in range(lo, hi + 1):
+            d = abs(ends[i] - acc)
+            if d > window and best is not None:
+                continue
+            score = d - (window * 0.8 if words[i].endswith(_PUNCT_END) else 0)
+            if best_score is None or score < best_score:
+                best, best_score = i, score
+        cuts.append(best)
+        prev = best
+    out, start = [], 0
+    for c in cuts + [len(words) - 1]:
+        out.append(' '.join(words[start:c + 1]))
+        start = c + 1
+    return out
+
+
+def _split_parts(text, orig_parts):
+    """Distribute an edited, space-joined multi-line subtitle back onto its timed lines.
+
+    Each line of a Table-3 entry has its own on-screen time window (start/end are
+    encoded in the line's sub-hash), so the text must be split where the original
+    lines were split. Words that still match the original are aligned to their
+    original line (difflib); inserted words stay with the preceding line. A text
+    with little in common with the original falls back to a proportional split
+    that prefers cuts after punctuation."""
+    import difflib
+    new_w = _words(text)
+    orig_w, owner = [], []
+    for i, p in enumerate(orig_parts):
+        for w in _words(p):
+            orig_w.append(w)
+            owner.append(i)
+    if not new_w:
+        return [''] * len(orig_parts)
+    sm = difflib.SequenceMatcher(None, orig_w, new_w, autojunk=False)
+    matched = sum(bl.size for bl in sm.get_matching_blocks())
+    if not orig_w or matched < 0.5 * len(orig_w):
+        return _split_proportional(text, orig_parts)
+    assign = [None] * len(new_w)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            for k in range(j2 - j1):
+                assign[j1 + k] = owner[i1 + k]
+        elif tag == 'replace':
+            for k in range(j2 - j1):
+                assign[j1 + k] = owner[i1 + (k * (i2 - i1)) // (j2 - j1)]
+    # inserted words: attach to the previous word's line (or the next one at the start)
+    cur = next((a for a in assign if a is not None), 0)
+    for j in range(len(new_w)):
+        if assign[j] is None:
+            assign[j] = cur
+        else:
+            cur = max(cur, assign[j])      # keep lines in order
+            assign[j] = cur
+    out = [[] for _ in orig_parts]
+    for w, a in zip(new_w, assign):
+        out[a].append(w)
+    return [' '.join(ws) for ws in out]
+
+
+def _plan_changes(x, new_strings, allow_blank=False):
+    """Returns ({ptr_loc_payload: new_text}, [kept_blank_keys]).
+
+    Table-1 strings that are empty or whitespace-only in the original ('', ' ', '\\n' ...)
+    are layout pieces the game glues between other texts (e.g. between a subtitle and
+    the next line). Changing them makes text appear in places it should not, so they are
+    kept unless allow_blank=True."""
+    changes = {}
+    kept_blank = []
+    for h, loc, s in x.t1:
+        k = f'{h:016x}'
+        if k not in new_strings:
+            continue
+        v = new_strings[k]
+        if isinstance(v, list):
+            v = ' '.join(v)
+        orig = x.text(s)
+        if v != orig:
+            if not allow_blank and orig.strip() == '':
+                kept_blank.append(k)
+                continue
+            changes[loc] = v
+    for h, parts in x.t3:
+        k = f'{h:016x}'
+        if k not in new_strings:
+            continue
+        v = new_strings[k]
+        orig = [x.text(s).strip() for _, _, s in parts]
+        n = len(parts)
+        if isinstance(v, list):
+            if len(v) != n:
+                if n == 1:
+                    v = ' '.join(v)
                 else:
-                    # Multi-part subtitle: preserve individual parts so timing audio cues work
-                    suffix = " MSTWW TEST EXPANSION"
-                    if new_text.endswith(suffix):
-                        for j, (se_ptr_loc, old_p, orig_part) in enumerate(sub_offs):
-                            txt = orig_part + (suffix if j == sub_cnt - 1 else "")
-                            new_off = add_to_pool(txt)
-                            t3_new_ptrs.append((se_ptr_loc, new_off))
-                    else:
-                        lines = new_text.split('\n')
-                        if len(lines) == sub_cnt:
-                            for j, (se_ptr_loc, old_p, orig_part) in enumerate(sub_offs):
-                                new_off = add_to_pool(lines[j].strip())
-                                t3_new_ptrs.append((se_ptr_loc, new_off))
-                        else:
-                            words_list = new_text.split()
-                            w_per_part = max(1, len(words_list) // sub_cnt)
-                            for j, (se_ptr_loc, old_p, orig_part) in enumerate(sub_offs):
-                                if j == sub_cnt - 1:
-                                    chunk = ' '.join(words_list[j * w_per_part :])
-                                else:
-                                    chunk = ' '.join(words_list[j * w_per_part : (j+1) * w_per_part])
-                                new_off = add_to_pool(chunk)
-                                t3_new_ptrs.append((se_ptr_loc, new_off))
+                    v = ' '.join(v)
             else:
-                for se_ptr_loc, old_p, orig_part in sub_offs:
-                    new_off = add_to_pool(orig_part)
-                    t3_new_ptrs.append((se_ptr_loc, new_off))
+                pieces = [str(p) for p in v]
+                for (sh, loc, s), new, old in zip(parts, pieces, orig):
+                    if new.strip() != old:
+                        changes[loc] = new
+                continue
+        if v == ' '.join(p for p in orig if p):
+            continue                      # unchanged
+        if n == 1:
+            changes[parts[0][1]] = v
+            continue
+        lines = v.split('\n')
+        if len(lines) == n:
+            pieces = [l.strip() for l in lines]
+        else:
+            pieces = _split_parts(v, orig)
+        for (sh, loc, s), new, old in zip(parts, pieces, orig):
+            if new != old:
+                changes[loc] = new
+    return changes, kept_blank
 
-        desc_pos_abs = sec_start + desc_pos
-        other_string_ptrs = []
-        sec6_relocs = [r for r in orig_relocs if r >= sec_start + desc_pos]
 
-        handled_ptr_locs = set([x[0] for x in t1_new_ptrs] + [x[0] for x in t3_new_ptrs])
-        for r in sec6_relocs:
-            rel_p = r - sec_start
-            if rel_p not in handled_ptr_locs:
-                val = struct.unpack('<Q', bytes(sec_data[rel_p : rel_p + 8]))[0]
-                if sec_start <= val < desc_pos_abs:
-                    p = val - sec_start
-                    txt = _read_cstr(bytes(sec_data), p)
-                    new_off = add_to_pool(txt)
-                    other_string_ptrs.append((rel_p, new_off))
+def repack_bytes(template_bytes, new_strings, name='<template>', allow_blank=False):
+    x = Xpps(template_bytes, name)
+    changes, kept_blank = _plan_changes(x, new_strings, allow_blank)
+    if not changes:
+        return bytes(template_bytes), x, {'kept_blank': kept_blank} if kept_blank else {}
 
-        # 1. Enforce SIMD 16-byte alignment invariant (desc_pos % 16 must be 8)
-        # In all official game files (Thai, Greek, Russian, etc.), desc_pos % 16 == 8
-        # so that t1_ptr (desc_pos + sec_start + 72) is strictly 16-byte SIMD vector aligned.
-        while (len(new_pool) % 16) != 8:
-            new_pool.append(0)
-        if len(new_pool) < desc_pos:
-            while len(new_pool) < desc_pos or (len(new_pool) % 16) != 8:
-                new_pool.append(0)
+    S = x.S
+    # ---- 1. new string blob appended after the original pool ---------------
+    existing = {}
+    for _, _, s in x.t1:
+        existing.setdefault(x.text(s), s)
+    for _, ps in x.t3:
+        for _, _, s in ps:
+            existing.setdefault(x.text(s), s)
+    blob = bytearray()
+    new_ptr = {}                 # ptr_loc -> new s6-relative string offset
+    added = {}
+    for loc in sorted(changes):
+        t = changes[loc]
+        if t in existing:
+            new_ptr[loc] = existing[t]
+            continue
+        if t not in added:
+            added[t] = x.tab_start + len(blob)
+            blob += t.encode('utf-8') + b'\x00'
+        new_ptr[loc] = added[t]
+    delta = (len(blob) + POOL_ALIGN - 1) // POOL_ALIGN * POOL_ALIGN
+    blob += b'\x00' * (delta - len(blob))
 
-        new_desc_pos = len(new_pool)
-        delta = new_desc_pos - desc_pos
+    s6, s6_end = x.s6, x.s6 + x.s6_size
 
-        tables_block = bytearray(sec_data[desc_pos:])
+    def mapv(v):
+        # payload offset in template -> payload offset in output
+        if v < s6 + x.tab_start:
+            return v                  # headers and original string pool do not move
+        return v + delta
 
-        for r in sec6_relocs:
-            rel_tbl_p = r - (sec_start + desc_pos)
-            val = struct.unpack('<Q', bytes(tables_block[rel_tbl_p : rel_tbl_p + 8]))[0]
-            if val >= desc_pos_abs:
-                struct.pack_into('<Q', tables_block, rel_tbl_p, val + delta)
+    # ---- 2. build the new payload -------------------------------------------
+    P = x.P
+    new_P = bytearray()
+    new_P += P[:s6 + x.tab_start]
+    new_P += blob
+    new_P += P[s6 + x.tab_start:x.s8]          # tables + font data (shifted)
+    new_s8 = x.s8 + delta
 
-        for ptr_loc, new_off in t1_new_ptrs:
-            rel_tbl_p = ptr_loc - desc_pos
-            struct.pack_into('<Q', tables_block, rel_tbl_p, sec_start + new_off)
+    # ---- 3. rewrite every relocated pointer ------------------------------
+    for loc in x.relocs:
+        nloc = mapv(loc)
+        v = _u64(P, loc)
+        if loc in new_ptr:
+            nv = s6 + new_ptr[loc]
+        else:
+            nv = mapv(v)
+        struct.pack_into('<Q', new_P, nloc, nv)
+    missing = set(new_ptr) - set(x.relocs)
+    if missing:
+        raise XppsError(f'{len(missing)} string pointers are not in the relocation table')
 
-        for ptr_loc, new_off in t3_new_ptrs:
-            rel_tbl_p = ptr_loc - desc_pos
-            struct.pack_into('<Q', tables_block, rel_tbl_p, sec_start + new_off)
+    # ---- 4. KNLI ------------------------------------------------------------
+    new_ops = []
+    for op in x.k_ops:
+        if op[0] == 'rel':
+            new_ops.append(('rel', mapv(op[1])))
+        else:
+            new_ops.append(op)
+    words = encode_relocs(new_ops)
+    stream = struct.pack(f'<{len(words)}H', *words)
+    end = KNLI_STREAM_OFF + len(stream)
+    dic_off = (end + 7) & ~7
+    K = bytearray(x.K[:KNLI_STREAM_OFF])
+    K += stream
+    K += b'\x00' * (dic_off - end)
+    dic = bytearray(x.k_dic)
+    # " DIC" footer: [magic, size, count(u64), count x (ptr+0x10, type_hash), ...]
+    n_dic = _u64(dic, 8)
+    for i in range(n_dic):
+        o = 16 + 16 * i
+        v = _u64(dic, o)
+        struct.pack_into('<Q', dic, o, mapv(v - 0x10) + 0x10)
+    K += dic
+    struct.pack_into('<I', K, 4, dic_off - 8)
+    struct.pack_into('<I', K, 16, len(words) - x.k_u6)
+    new_P += K
 
-        for ptr_loc, new_off in other_string_ptrs:
-            rel_tbl_p = ptr_loc - desc_pos
-            struct.pack_into('<Q', tables_block, rel_tbl_p, sec_start + new_off)
+    # ---- 5. header ------------------------------------------------------------
+    hdr = bytearray(x.data[:x.H])
+    old = {'s7': x.s7, 's8': x.s8, 'k': x.s8_size}
+    new = {'s7': x.s7 + delta, 's8': new_s8, 'k': len(K)}
+    struct.pack_into('<I', hdr, 0x2c, len(new_P))
+    struct.pack_into('<III', hdr, x.trip_off['s6'], x.s6_flags, x.s6_size + delta, x.s6)
+    struct.pack_into('<III', hdr, x.trip_off['s7'], x.s7_flags, x.s7_size, new['s7'])
+    struct.pack_into('<III', hdr, x.trip_off['s8'], x.s8_flags, new['k'], new['s8'])
+    # memory-segment table in the upper header repeats s7 offset, KNLI size/offset
+    for off in range(0x30, x.H - 64, 4):
+        v = struct.unpack_from('<I', hdr, off)[0]
+        for key in ('s7', 's8', 'k'):
+            if v == old[key] and old[key] != new[key]:
+                struct.pack_into('<I', hdr, off, new[key])
+                break
+    out = bytes(hdr) + bytes(new_P)
+    info = {'changed_pointers': len(changes), 'appended_bytes': len(blob), 'delta': delta,
+            'kept_blank': kept_blank}
+    return out, x, info
 
-        new_s6_data = new_pool + tables_block
-        pad_s6 = (16 - (len(new_s6_data) % 16)) % 16
-        new_s6_data.extend(b'\x00' * pad_s6)
-        new_s6_size = len(new_s6_data)
 
-        orig_sec7_off = sec_start + sec_size
-        new_sec7_off = sec_start + new_s6_size
+def verify_repack(template_bytes, out_bytes, new_strings=None):
+    """Structural check of an output file against its template. Returns list of problems."""
+    probs = []
+    a = Xpps(template_bytes, 'template')
+    try:
+        b = Xpps(out_bytes, 'output')
+    except XppsError as e:
+        return [f'output does not parse: {e}']
+    delta = b.s7 - a.s7
+    if delta < 0 or delta % 16:
+        probs.append(f'bad section delta {delta}')
+    for k in ('s6', 's7_size', 't1_cnt', 't2_cnt', 't3_cnt', 'k_u5', 'k_u6'):
+        if getattr(a, k) != getattr(b, k):
+            probs.append(f'{k} differs')
+    if b.desc_pos != a.desc_pos + delta:
+        probs.append('descriptor moved unexpectedly')
+    if b.s6_size != a.s6_size + delta or b.s8 != a.s8 + delta:
+        probs.append('section sizes inconsistent')
+    if b.P[b.s7:b.s7 + b.s7_size] != a.P[a.s7:a.s7 + a.s7_size]:
+        probs.append('font/texture section changed')
+    if len(a.relocs) != len(b.relocs):
+        probs.append('relocation count differs')
+        return probs
 
-        # 2. Update Section 0 root pointers and Section 1..6 font data pointers
-        new_hdr_payload = bytearray(data[hdr_size : hdr_size + sec_start])
+    def mapv(v):
+        return v if v < a.s6 + a.tab_start else v + delta
+    str_locs = {loc for _, loc, _ in a.t1} | {loc for _, ps in a.t3 for _, loc, _ in ps}
+    bad = 0
+    for la, lb in zip(a.relocs, b.relocs):
+        if mapv(la) != lb:
+            bad += 1
+            continue
+        va, vb = _u64(a.P, la), _u64(b.P, lb)
+        if la in str_locs:
+            if not (b.s6 <= vb < b.s6 + b.tab_start) or (vb - b.s6 and b.S[vb - b.s6 - 1] != 0):
+                bad += 1
+        elif mapv(va) != vb:
+            bad += 1
+    if bad:
+        probs.append(f'{bad} relocated pointers are wrong')
+    # every non-pointer byte of headers + tables must be unchanged
+    ma = bytearray(a.P[:a.s6]) + bytearray(a.P[a.s6 + a.tab_start:a.s8])
+    mb = bytearray(b.P[:b.s6]) + bytearray(b.P[b.s6 + b.tab_start:b.s8])
+    if len(ma) != len(mb):
+        probs.append('table block size differs')
+    else:
+        def to_idx(loc, x):
+            return loc if loc < x.s6 else loc - (x.s6 + x.tab_start) + x.s6
+        for loc in a.relocs:
+            i = to_idx(loc, a)
+            ma[i:i + 8] = b'\0' * 8
+        for loc in b.relocs:
+            i = to_idx(loc, b)
+            mb[i:i + 8] = b'\0' * 8
+        if ma != mb:
+            n = sum(1 for p, q in zip(ma, mb) if p != q)
+            probs.append(f'{n} non-pointer bytes in tables differ')
+    dic_a, dic_b = a.k_dic, b.k_dic
+    if len(dic_a) != len(dic_b):
+        probs.append('DIC footer size differs')
+    else:
+        for i in range(_u64(dic_b, 8)):
+            o = 16 + 16 * i
+            if _u64(dic_b, o) != mapv(_u64(dic_a, o) - 0x10) + 0x10 or dic_a[o + 8:o + 16] != dic_b[o + 8:o + 16]:
+                probs.append('DIC footer pointers are wrong')
+                break
+        n = _u64(dic_a, 8)
+        if dic_a[16 + 16 * n:] != dic_b[16 + 16 * n:] or dic_a[:16] != dic_b[:16]:
+            probs.append('DIC footer header/trailer changed')
+    # header: only size/offset fields may change
+    ha, hb = a.data[:a.H], b.data[:b.H]
+    changed = [o for o in range(0, a.H, 4) if ha[o:o + 4] != hb[o:o + 4]]
+    for o in changed:
+        va, vb = struct.unpack_from('<I', ha, o)[0], struct.unpack_from('<I', hb, o)[0]
+        if vb - va not in (delta, b.s8_size - a.s8_size, len(b.P) - len(a.P)):
+            probs.append(f'unexpected header change at 0x{o:x}')
+    if new_strings is not None:
+        got = b.strings()
+        want = a.strings()
+        for k, v in new_strings.items():
+            if k in want:
+                want[k] = ' '.join(p for p in (s.strip() for s in v) if p) if isinstance(v, list) else v
+        # multi-part entries are stored split; compare with whitespace normalised
+        norm = lambda s: ' '.join(s.split())
+        diff = [k for k in want if norm(want[k]) != norm(got.get(k, ''))]
+        if diff:
+            probs.append(f'{len(diff)} strings do not read back as expected (e.g. {diff[0]})')
+    return probs
 
-        # Shift all 7 Section 0 root pointers (payload 0x010..0x068) by delta:
-        s0_rel_offs = [0x010, 0x020, 0x030, 0x040, 0x050, 0x060, 0x068]
-        for p_off in s0_rel_offs:
-            val = struct.unpack('<I', new_hdr_payload[p_off : p_off + 4])[0]
-            struct.pack_into('<I', new_hdr_payload, p_off, val + delta)
 
-        # Shift the 6 Section 1..6 font data pointers (these point into Section 8):
-        for r in orig_relocs:
-            if r < sec_start:
-                val = struct.unpack('<I', bytes(new_hdr_payload[r:r+4]))[0]
-                if val >= orig_sec7_off:
-                    struct.pack_into('<I', new_hdr_payload, r, val + delta)
-
-        # 3. Re-encode KNLI Relocations Bytecode
-        new_relocs = []
-        for r in orig_relocs:
-            if r < sec_start:
-                new_relocs.append(r)
-            else:
-                new_relocs.append(r + delta)
-
-        words_enc = [0x800d]
-        cur_p = 0
-        for addr in new_relocs:
-            dw = addr // 4
-            p = dw // 0x8000
-            w = dw % 0x8000
-            if p != cur_p:
-                words_enc.append(0xc000 | p)
-                cur_p = p
-            words_enc.append(w)
-
-        knli_stream = struct.pack(f'<{len(words_enc)}H', *words_enc)
-        stream_len = len(knli_stream)
-
-        # 4. Update the 208-byte immutable magic tail block
-        # In all official game files (Turkish, Greek, Thai, Russian, etc.),
-        # KNLI ends with a fixed 208-byte block containing 6 font records, 1 desc record,
-        # and the magic footer '297E4C1ABD00B570 20444E45 00000000' (END \0\0\0\0).
-        tail_core = bytearray(knli_orig[-208:])
-        core_ptr_offsets = [8, 40, 72, 104, 136, 168, 184]
-        for toff in core_ptr_offsets:
-            old_val = struct.unpack('<I', tail_core[toff:toff+4])[0]
-            struct.pack_into('<I', tail_core, toff, old_val + delta)
-
-        # Mid-stream alignment padding:
-        # Pre-tail record header: struct.pack('<II', 0x270, 0) [8 bytes]
-        # Pad between bytecode stream and pre-tail so total payload is 8-byte aligned.
-        pad_mid = (8 - (stream_len % 8)) % 8
-        mid_padding = b'\x00' * pad_mid
-        pre_tail = struct.pack('<II', 0x270, 0)
-
-        knli_payload = knli_stream + mid_padding + pre_tail + tail_core
-        new_knli_size = 32 + len(knli_payload)
-        new_comp_size = new_knli_size - 240
-
-        new_knli_hdr = struct.pack('<IIIIIIII', magic, new_comp_size, ver, 0, len(new_relocs), u1, u2, u3)
-        new_knli = new_knli_hdr + knli_payload
-
-        sec1_flags, sec1_size, sec1_offset = struct.unpack('<III', bytes(data[hdr_size - 40: hdr_size - 28]))
-        sec7_data = data[hdr_size + orig_sec7_off : hdr_size + orig_sec7_off + sec1_size]
-        new_sec8_off = new_sec7_off + len(sec7_data)
-
-        new_payload = new_hdr_payload + new_s6_data + sec7_data + new_knli
-        new_header = bytearray(data[:hdr_size])
-
-        struct.pack_into('<I', new_header, 0x02c, len(new_payload))
-        struct.pack_into('<I', new_header, 0x0ec, new_sec7_off)
-        struct.pack_into('<I', new_header, 0x118, new_sec7_off)
-        struct.pack_into('<I', new_header, 0x13c, new_knli_size)
-        struct.pack_into('<I', new_header, 0x140, new_sec8_off)
-        struct.pack_into('<I', new_header, 0x1b4, new_s6_size)
-        struct.pack_into('<I', new_header, 0x1c4, new_sec7_off)
-        struct.pack_into('<I', new_header, 0x1cc, new_knli_size)
-        struct.pack_into('<I', new_header, 0x1d0, new_sec8_off)
-
-        out_data = bytes(new_header) + bytes(new_payload)
-
+def repack_xpps(template_path, new_strings, output_path, verify=True, allow_blank=False):
+    with open(template_path, 'rb') as f:
+        tpl = f.read()
+    out, x, info = repack_bytes(tpl, new_strings, template_path, allow_blank)
+    expected = {k: v for k, v in new_strings.items() if k not in set(info.get('kept_blank', ()))}
+    probs = verify_repack(tpl, out, expected) if verify else []
+    if probs:
+        raise XppsError('verification failed, output NOT written:\n  - ' + '\n  - '.join(probs))
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-
     with open(output_path, 'wb') as f:
-        f.write(out_data)
-
-    return len(out_data)
+        f.write(out)
+    return len(out), info
 
 
 def _load_strings(file_path):
-    """Loads translations from .xpps, .bak, or .json file."""
     if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-
+        raise FileNotFoundError(f'File not found: {file_path}')
     with open(file_path, 'rb') as f:
         magic = f.read(4)
-
     if magic == b'KCAP':
         return extract_xpps(file_path)
-    else:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected JSON object in {file_path}")
-        return data
+    with open(file_path, 'r', encoding='utf-8-sig') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f'Expected JSON object in {file_path}')
+    return data
 
 
 # ---------------------------------------------------------------------------
-# CLI Commands
+# CLI
 # ---------------------------------------------------------------------------
+
+def _write_json(path, obj):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
 
 def cmd_extract(args):
-    """
-    extract command:
-      xpps_tool extract <input.xpps | folder> [-o <output_path_or_dir>]
-    """
-    output_arg = args.output
-
-    if os.path.isfile(args.input) and args.input.lower().endswith('.xpps'):
-        # Single file extraction
-        file_path = args.input
-        base = os.path.basename(file_path)
-        lang_code = LANG_MAP.get(base, 'extracted')
-        print(f"Extracting: {file_path}  (language: {lang_code})")
-        strings = extract_xpps(file_path, clean_pua=args.clean_pua)
-        print(f"  [+] {len(strings)} strings extracted")
-
-        if output_arg and output_arg.lower().endswith('.json'):
-            out_json = output_arg
-            out_dir = os.path.dirname(out_json)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
+    kw = dict(clean_pua=args.clean_pua, parts_as_list=args.parts_as_list)
+    if os.path.isfile(args.input):
+        base = os.path.basename(args.input)
+        lang = LANG_MAP.get(base, 'extracted')
+        print(f'Extracting: {args.input}  (language: {lang})')
+        strings = extract_xpps(args.input, **kw)
+        print(f'  [+] {len(strings)} strings extracted')
+        if args.output and args.output.lower().endswith('.json'):
+            out = args.output
         else:
-            out_dir = output_arg if output_arg else 'translations'
-            lang_dir = os.path.join(out_dir, lang_code)
-            os.makedirs(lang_dir, exist_ok=True)
-            out_json = os.path.join(lang_dir, 'strings.json')
-
-        with open(out_json, 'w', encoding='utf-8') as f:
-            json.dump(strings, f, ensure_ascii=False, indent=2)
-        print(f"  [>] Saved → {out_json}")
-
+            out = os.path.join(args.output or 'translations', lang, 'strings.json')
+        _write_json(out, strings)
+        print(f'  [>] Saved -> {out}')
     elif os.path.isdir(args.input):
-        # Folder batch extraction
-        folder = args.input
-        files_found = []
-        for filename, code in LANG_MAP.items():
-            fp = os.path.join(folder, filename)
-            if os.path.exists(fp):
-                files_found.append((code, fp))
-
-        if not files_found:
-            # Check for any .xpps in the folder
-            for f in os.listdir(folder):
-                if f.lower().endswith('.xpps'):
-                    files_found.append(('custom', os.path.join(folder, f)))
-
-        if not files_found:
-            print(f"Error: No .xpps files found in {folder}")
+        found = [(LANG_MAP.get(f, os.path.splitext(f)[0]), os.path.join(args.input, f))
+                 for f in sorted(os.listdir(args.input)) if f.lower().endswith('_text.xpps')]
+        if not found:
+            print(f'Error: no *_text.xpps files in {args.input}')
             sys.exit(1)
-
-        out_dir = output_arg if output_arg else 'translations'
-        print(f"Extracting {len(files_found)} .xpps files → {out_dir}")
-        for code, fp in sorted(files_found):
+        out_dir = args.output or 'translations'
+        for code, fp in found:
             t0 = time.time()
-            strings = extract_xpps(fp, clean_pua=args.clean_pua)
-            fname = os.path.splitext(os.path.basename(fp))[0]
-            lang_dir = os.path.join(out_dir, code if code != 'custom' else fname)
-            os.makedirs(lang_dir, exist_ok=True)
-            out_json = os.path.join(lang_dir, 'strings.json')
-            with open(out_json, 'w', encoding='utf-8') as f:
-                json.dump(strings, f, ensure_ascii=False, indent=2)
-            print(f"  [>] {os.path.basename(fp):<26} {len(strings):>5} strings → {out_json}  ({time.time()-t0:.1f}s)")
-
-        print(f"\n[OK] Batch extraction complete: {out_dir}")
-
+            strings = extract_xpps(fp, **kw)
+            out = os.path.join(out_dir, code, 'strings.json')
+            _write_json(out, strings)
+            print(f'  [>] {os.path.basename(fp):<27} {len(strings):>6} strings -> {out} ({time.time()-t0:.1f}s)')
+        print(f'\n[OK] Batch extraction complete: {out_dir}')
     else:
-        print(f"Error: '{args.input}' is neither a .xpps file nor a directory.")
+        print(f"Error: '{args.input}' is neither a file nor a directory.")
         sys.exit(1)
 
 
 def cmd_repack(args):
-    """
-    repack command:
-      xpps_tool repack <strings.json> -t <template.xpps> [-o <output.xpps>]
-    """
-    strings_file = args.strings_file
-    template_path = args.template
-
-    if not os.path.exists(strings_file):
-        print(f"Error: Translation file not found: {strings_file}")
+    if not os.path.exists(args.strings_file):
+        print(f'Error: translation file not found: {args.strings_file}')
         sys.exit(1)
-    if not os.path.exists(template_path):
-        print(f"Error: Template file not found: {template_path}")
+    if not os.path.exists(args.template):
+        print(f'Error: template file not found: {args.template}')
         sys.exit(1)
-
-    if args.output:
-        output_path = args.output
+    output = args.output or '{0}_modded{1}'.format(*os.path.splitext(args.template))
+    if os.path.abspath(output) == os.path.abspath(args.template):
+        print('Error: output must not overwrite the template (keep the original as template).')
+        sys.exit(1)
+    print(f'Loading translations: {args.strings_file}')
+    new_strings = _load_strings(args.strings_file)
+    print(f'  Strings:     {len(new_strings):,}')
+    print(f'  Template:    {args.template}')
+    print(f'  Destination: {output}')
+    t0 = time.time()
+    try:
+        size, info = repack_xpps(args.template, new_strings, output, verify=not args.no_verify,
+                                 allow_blank=args.allow_blank)
+    except XppsError as e:
+        print(f'\n[ERROR] {e}')
+        sys.exit(2)
+    kept = info.get('kept_blank', [])
+    if kept:
+        print(f"\n  [!] {len(kept)} empty/whitespace-only layout strings were left unchanged "
+              f"(e.g. {kept[0]}).\n      The game joins them between other texts; use --allow-blank to edit them anyway.")
+    if not info.get('changed_pointers'):
+        print('\n[OK] No strings differ from the template; output is identical to the template.')
     else:
-        base, ext = os.path.splitext(template_path)
-        output_path = f"{base}_modded{ext}"
+        print(f"\n  Changed string pointers: {info['changed_pointers']:,}")
+        print(f"  Added text:              {info['appended_bytes']:,} bytes")
+    print(f'[OK] Written {output}  ({size:,} bytes, {time.time()-t0:.1f}s)')
+    if not args.no_verify:
+        print('[OK] Structural verification passed (relocations, tables, KNLI, all strings).')
 
-    print(f"Loading translations from: {strings_file}")
-    try:
-        new_strings = _load_strings(strings_file)
-    except Exception as e:
-        print(f"Error loading translation file: {e}")
-        sys.exit(1)
 
-    print(f"  Loaded strings: {len(new_strings)}")
-    print(f"  Template file:  {template_path}")
-    print(f"  Destination:    {output_path}")
+def cmd_verify(args):
+    with open(args.template, 'rb') as f:
+        a = f.read()
+    with open(args.file, 'rb') as f:
+        b = f.read()
+    ns = _load_strings(args.strings) if args.strings else None
+    probs = verify_repack(a, b, ns)
+    if probs:
+        print('[FAIL]')
+        for p in probs:
+            print('  -', p)
+        sys.exit(2)
+    print('[OK] File is structurally consistent with the template.')
 
-    force_expand = getattr(args, 'force_expand', False)
-    new_sec_size = repack_xpps(template_path, new_strings, output_path, force_expand=force_expand)
-    out_bytes = os.path.getsize(output_path)
-    print(f"\n[OK] Repacked .xpps created: {output_path}  ({out_bytes:,} bytes)")
 
-    if getattr(args, 'no_verify', False):
-        return
-
-    # Automatic verification check
-    print("Verifying repacked archive...")
-    try:
-        orig_strings = extract_xpps(template_path)
-        repacked_strings = extract_xpps(output_path)
-        if len(orig_strings) == len(repacked_strings):
-            print(f"  [OK] Verification passed! String count: {len(repacked_strings):,}")
-        else:
-            print(f"  [WARNING] String count mismatch: template={len(orig_strings)}, repacked={len(repacked_strings)}")
-    except Exception as e:
-        print(f"  [WARNING] Verification check failed: {e}")
+def cmd_to_list(args):
+    """Convert a JSON with space-joined subtitles into per-line lists, split exactly
+    like `repack` would split them, so every timed line can be checked by hand."""
+    with open(args.template, 'rb') as f:
+        x = Xpps(f.read(), args.template)
+    data = _load_strings(args.strings_file)
+    n = 0
+    for h, parts in x.t3:
+        k = f'{h:016x}'
+        if len(parts) < 2 or k not in data or isinstance(data[k], list):
+            continue
+        orig = [x.text(s).strip() for _, _, s in parts]
+        v = data[k]
+        lines = v.split('\n')
+        data[k] = [l.strip() for l in lines] if len(lines) == len(parts) else _split_parts(v, orig)
+        n += 1
+    out = args.output or os.path.splitext(args.strings_file)[0] + '_lines.json'
+    _write_json(out, data)
+    print(f'[OK] {n} multi-line subtitles converted to lists -> {out}')
 
 
 def cmd_diff(args):
-    """
-    diff command:
-      xpps_tool diff <original> <translated> [-o <modified.json>]
-    """
-    print("Comparing translation files:")
-    print(f"  Original:   {args.file1}")
-    print(f"  Translated: {args.file2}\n")
-
-    try:
-        orig = _load_strings(args.file1)
-        trans = _load_strings(args.file2)
-    except Exception as e:
-        print(f"Error loading files: {e}")
-        sys.exit(1)
-
-    common_keys = set(orig.keys()) & set(trans.keys())
-    missing_in_trans = set(orig.keys()) - set(trans.keys())
-    added_in_trans = set(trans.keys()) - set(orig.keys())
-
-    modified = {}
-    identical_count = 0
-    for k in common_keys:
-        if orig[k] != trans[k]:
-            modified[k] = {'original': orig[k], 'translated': trans[k]}
-        else:
-            identical_count += 1
-
-    total_orig = len(orig)
-    pct = (len(modified) / total_orig * 100) if total_orig > 0 else 0.0
-
-    print("=" * 50)
-    print("Translation Progress & Statistics")
-    print("=" * 50)
-    print(f"  Total original strings:    {len(orig):>7,}")
-    print(f"  Total translated strings:  {len(trans):>7,}")
-    print(f"  Modified / Translated:     {len(modified):>7,}  ({pct:.2f}%)")
-    print(f"  Identical (untouched):     {identical_count:>7,}")
-    if missing_in_trans:
-        print(f"  Missing in translated:     {len(missing_in_trans):>7,}")
-    if added_in_trans:
-        print(f"  Added new keys:            {len(added_in_trans):>7,}")
-
-    if modified:
-        print("\nSample Modified Strings (first 5):")
-        for i, (k, v) in enumerate(list(modified.items())[:5]):
-            orig_snippet = v['original'][:60] + ('...' if len(v['original']) > 60 else '')
-            trans_snippet = v['translated'][:60] + ('...' if len(v['translated']) > 60 else '')
-            print(f"  [{k}]")
-            print(f"    - Original:   {orig_snippet}")
-            print(f"    + Translated: {trans_snippet}")
-
+    orig = _load_strings(args.file1)
+    trans = _load_strings(args.file2)
+    as_s = lambda v: ' '.join(v) if isinstance(v, list) else v
+    common = set(orig) & set(trans)
+    modified = {k: (as_s(orig[k]), as_s(trans[k])) for k in common if as_s(orig[k]) != as_s(trans[k])}
+    pct = len(modified) / len(orig) * 100 if orig else 0.0
+    print('=' * 50)
+    print(f'  Original strings:   {len(orig):>8,}')
+    print(f'  Translated strings: {len(trans):>8,}')
+    print(f'  Modified:           {len(modified):>8,}  ({pct:.2f}%)')
+    print(f'  Identical:          {len(common) - len(modified):>8,}')
+    if set(orig) - set(trans):
+        print(f'  Missing in translated: {len(set(orig) - set(trans)):,}')
+    if set(trans) - set(orig):
+        print(f'  Unknown keys (ignored on repack): {len(set(trans) - set(orig)):,}')
+    for k, (o, t) in list(modified.items())[:5]:
+        print(f'  [{k}]\n    - {o[:70]}\n    + {t[:70]}')
     if args.output:
-        out_dict = {k: v['translated'] for k, v in modified.items()}
-        with open(args.output, 'w', encoding='utf-8') as f:
-            json.dump(out_dict, f, ensure_ascii=False, indent=2)
-        print(f"\n[OK] Exported {len(modified)} modified strings to: {args.output}")
+        _write_json(args.output, {k: trans[k] for k in modified})
+        print(f'\n[OK] Exported {len(modified)} modified strings to {args.output}')
 
-
-# ---------------------------------------------------------------------------
-# CLI Parser
-# ---------------------------------------------------------------------------
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        prog='xpps_tool',
-        description=(
-            "Ghost of Tsushima Localization Tool (v2.2)\n"
-            "Extract, edit, and repack .xpps localization files for game translations and modding."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    sub = parser.add_subparsers(dest='command', metavar='<command>')
+    p = argparse.ArgumentParser(prog='xpps_tool',
+                                description=f'Ghost of Tsushima Localization Tool v{VERSION}')
+    sub = p.add_subparsers(dest='command', metavar='<command>')
 
-    # extract subcommand
-    p_ext = sub.add_parser(
-        'extract',
-        help='Extract localization text from .xpps file(s) into editable JSON',
-    )
-    p_ext.add_argument(
-        'input',
-        help='Path to a .xpps file or folder containing .xpps files',
-    )
-    p_ext.add_argument(
-        '-o', '--output',
-        default=None,
-        help='Output .json file path (for single file) or output directory (default: translations)',
-    )
-    p_ext.add_argument(
-        '--clean-pua', action='store_true',
-        help='Strip controller button glyphs (Unicode PUA icons) from extracted text',
-    )
+    e = sub.add_parser('extract', help='Extract text from .xpps file(s) into JSON')
+    e.add_argument('input', help='.xpps file or folder with lang_*_text.xpps files')
+    e.add_argument('-o', '--output', help='output .json (single file) or directory')
+    e.add_argument('--clean-pua', action='store_true', help='strip controller glyphs (do not repack such output)')
+    e.add_argument('--parts-as-list', action='store_true',
+                   help='write multi-part subtitles as JSON lists (one item per subtitle line)')
 
-    # repack subcommand
-    p_rep = sub.add_parser(
-        'repack',
-        help='Rebuild a .xpps file from modified translation JSON using a template',
-    )
-    p_rep.add_argument(
-        'strings_file',
-        help='Path to translated strings.json',
-    )
-    p_rep.add_argument(
-        '-t', '--template',
-        required=True,
-        help='Original game .xpps file to use as binary template',
-    )
-    p_rep.add_argument(
-        '-o', '--output',
-        default=None,
-        help='Path for the repacked .xpps file (default: <template>_modded.xpps)',
-    )
-    p_rep.add_argument(
-        '--no-verify', action='store_true',
-        help='Skip automatic verification check after repacking',
-    )
-    p_rep.add_argument(
-        '--force-expand', action='store_true',
-        help='Force dynamic pool expansion and KNLI relocation rebuild even if text fits duplicate slots',
-    )
+    r = sub.add_parser('repack', help='Rebuild a .xpps from translated JSON')
+    r.add_argument('strings_file', help='translated strings.json')
+    r.add_argument('-t', '--template', required=True, help='ORIGINAL game .xpps used as template')
+    r.add_argument('-o', '--output', help='output path (default: <template>_modded.xpps)')
+    r.add_argument('--no-verify', action='store_true', help='skip the structural verification')
+    r.add_argument('--allow-blank', action='store_true',
+                   help='also change strings that are empty/whitespace in the original (layout pieces)')
+    r.add_argument('--force-expand', action='store_true', help=argparse.SUPPRESS)  # v2 compatibility
 
-    # diff subcommand
-    p_diff = sub.add_parser(
-        'diff',
-        help='Compare two translation files or check translation progress',
-    )
-    p_diff.add_argument(
-        'file1',
-        help='Original file (.xpps or strings.json)',
-    )
-    p_diff.add_argument(
-        'file2',
-        help='Translated file (.xpps or strings.json)',
-    )
-    p_diff.add_argument(
-        '-o', '--output', default=None,
-        help='Optional path to export modified strings as JSON',
-    )
+    v = sub.add_parser('verify', help='Check a repacked .xpps against the original template')
+    v.add_argument('file', help='repacked .xpps')
+    v.add_argument('-t', '--template', required=True, help='original .xpps')
+    v.add_argument('-s', '--strings', help='optional strings.json the file was built from')
 
-    return parser
+    tl = sub.add_parser('to-list', help='Split joined multi-line subtitles in a JSON into per-line lists')
+    tl.add_argument('strings_file', help='translated strings.json')
+    tl.add_argument('-t', '--template', required=True, help='original .xpps')
+    tl.add_argument('-o', '--output', help='output json (default: <name>_lines.json)')
+
+    d = sub.add_parser('diff', help='Compare two localization files')
+    d.add_argument('file1')
+    d.add_argument('file2')
+    d.add_argument('-o', '--output', help='export modified strings as JSON')
+    return p
 
 
 def main():
-    print("=" * 70)
-    print("Ghost of Tsushima Localization Tool  v2.2")
-    print("=" * 70)
-
-    # Direct single argument drag-and-drop support:
-    # e.g. dragging a .xpps onto xpps_tool.exe
+    print('=' * 70)
+    print(f'Ghost of Tsushima Localization Tool  v{VERSION}')
+    print('=' * 70)
     if len(sys.argv) == 2 and sys.argv[1].lower().endswith('.xpps') and os.path.isfile(sys.argv[1]):
-        file_path = sys.argv[1]
-        base = os.path.splitext(file_path)[0]
-        out_json = f"{base}_strings.json"
-        print(f"Auto-extracting: {file_path}")
-        strings = extract_xpps(file_path)
-        with open(out_json, 'w', encoding='utf-8') as f:
-            json.dump(strings, f, ensure_ascii=False, indent=2)
-        print(f"[OK] Extracted {len(strings)} strings → {out_json}")
+        fp = sys.argv[1]
+        out = os.path.splitext(fp)[0] + '_strings.json'
+        strings = extract_xpps(fp)
+        _write_json(out, strings)
+        print(f'[OK] Extracted {len(strings)} strings -> {out}')
         return
-
     parser = build_parser()
-
     if len(sys.argv) == 1:
         parser.print_help()
         return
-
     args = parser.parse_args()
-
-    if args.command == 'extract':
-        cmd_extract(args)
-    elif args.command == 'repack':
-        cmd_repack(args)
-    elif args.command == 'diff':
-        cmd_diff(args)
-    else:
-        parser.print_help()
+    {'extract': cmd_extract, 'repack': cmd_repack, 'verify': cmd_verify,
+     'to-list': cmd_to_list, 'diff': cmd_diff}.get(args.command, lambda a: parser.print_help())(args)
 
 
 if __name__ == '__main__':
