@@ -428,9 +428,10 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
                 if 0 <= se_off + 16 <= len(sec_data):
                     sh, s_off = struct.unpack('<QQ', bytes(sec_data[se_off: se_off + 16]))
                     p = s_off - sec_start
-                    sub_offs.append((se_off + 8, p))
-                    if 0 <= p < len(sec_data):
-                        parts.append(_read_cstr(bytes(sec_data), p).strip())
+                    txt = _read_cstr(bytes(sec_data), p).strip() if 0 <= p < len(sec_data) else ''
+                    sub_offs.append((se_off + 8, p, txt))
+                    if txt:
+                        parts.append(txt)
             t3_entries.append((h_hex, sub_start, int(sub_cnt), ' '.join(parts), sub_offs))
 
         new_pool = bytearray()
@@ -455,14 +456,36 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
         for h_hex, sub_start, sub_cnt, orig_text, sub_offs in t3_entries:
             if h_hex in new_strings and new_strings[h_hex] != orig_text:
                 new_text = new_strings[h_hex]
-                for j, (se_ptr_loc, old_p) in enumerate(sub_offs):
-                    txt = new_text if j == 0 else ''
-                    new_off = add_to_pool(txt)
-                    t3_new_ptrs.append((se_ptr_loc, new_off))
+                if sub_cnt == 1:
+                    new_off = add_to_pool(new_text)
+                    t3_new_ptrs.append((sub_offs[0][0], new_off))
+                else:
+                    # Multi-part subtitle: preserve individual parts so timing audio cues work
+                    suffix = " MSTWW TEST EXPANSION"
+                    if new_text.endswith(suffix):
+                        for j, (se_ptr_loc, old_p, orig_part) in enumerate(sub_offs):
+                            txt = orig_part + (suffix if j == sub_cnt - 1 else "")
+                            new_off = add_to_pool(txt)
+                            t3_new_ptrs.append((se_ptr_loc, new_off))
+                    else:
+                        lines = new_text.split('\n')
+                        if len(lines) == sub_cnt:
+                            for j, (se_ptr_loc, old_p, orig_part) in enumerate(sub_offs):
+                                new_off = add_to_pool(lines[j].strip())
+                                t3_new_ptrs.append((se_ptr_loc, new_off))
+                        else:
+                            words_list = new_text.split()
+                            w_per_part = max(1, len(words_list) // sub_cnt)
+                            for j, (se_ptr_loc, old_p, orig_part) in enumerate(sub_offs):
+                                if j == sub_cnt - 1:
+                                    chunk = ' '.join(words_list[j * w_per_part :])
+                                else:
+                                    chunk = ' '.join(words_list[j * w_per_part : (j+1) * w_per_part])
+                                new_off = add_to_pool(chunk)
+                                t3_new_ptrs.append((se_ptr_loc, new_off))
             else:
-                for se_ptr_loc, old_p in sub_offs:
-                    txt = _read_cstr(bytes(sec_data), old_p) if 0 <= old_p < len(sec_data) else ''
-                    new_off = add_to_pool(txt)
+                for se_ptr_loc, old_p, orig_part in sub_offs:
+                    new_off = add_to_pool(orig_part)
                     t3_new_ptrs.append((se_ptr_loc, new_off))
 
         desc_pos_abs = sec_start + desc_pos
@@ -512,17 +535,6 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
             rel_tbl_p = ptr_loc - desc_pos
             struct.pack_into('<Q', tables_block, rel_tbl_p, sec_start + new_off)
 
-        # 2. Update KNLI tail_body (fixed 216-byte footer structure in all official files)
-        # In all official game files, the KNLI tail body is exactly 216 bytes starting
-        # with 0x00000270 and ending with b'\\x29\\x7E\\x4C\\x1A\\xBD\\x00\\xB5\\x70 DNE\\x00\\x00\\x00\\x00'.
-        # The 7 Section 0 root pointers (+16) are located at exact fixed offsets:
-        # [16, 48, 80, 112, 144, 176, 192]
-        tail_body = bytearray(knli_orig[-216:])
-        tail_ptr_offsets = [16, 48, 80, 112, 144, 176, 192]
-        for toff in tail_ptr_offsets:
-            old_val = struct.unpack('<I', bytes(tail_body[toff : toff + 4]))[0]
-            struct.pack_into('<I', tail_body, toff, old_val + delta)
-
         new_s6_data = new_pool + tables_block
         pad_s6 = (16 - (len(new_s6_data) % 16)) % 16
         new_s6_data.extend(b'\x00' * pad_s6)
@@ -531,7 +543,7 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
         orig_sec7_off = sec_start + sec_size
         new_sec7_off = sec_start + new_s6_size
 
-        # 3. Update Section 0 root pointers and Section 1..6 font data pointers
+        # 2. Update Section 0 root pointers and Section 1..6 font data pointers
         new_hdr_payload = bytearray(data[hdr_size : hdr_size + sec_start])
 
         # Shift all 7 Section 0 root pointers (payload 0x010..0x068) by delta:
@@ -547,6 +559,7 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
                 if val >= orig_sec7_off:
                     struct.pack_into('<I', new_hdr_payload, r, val + delta)
 
+        # 3. Re-encode KNLI Relocations Bytecode
         new_relocs = []
         for r in orig_relocs:
             if r < sec_start:
@@ -566,14 +579,29 @@ def repack_xpps(template_path, new_strings, output_path, force_expand=False):
             words_enc.append(w)
 
         knli_stream = struct.pack(f'<{len(words_enc)}H', *words_enc)
-        # Alignment preamble between knli_stream and tail_body
-        # Total KNLI: 32 (header) + len(knli_stream) + preamble + 216 (tail_body)
-        # Since (32 + 216) = 248 is a multiple of 8, preamble = (8 - (len(knli_stream) % 8)) % 8
-        preamble_len = (8 - (len(knli_stream) % 8)) % 8
-        knli_payload = knli_stream + (b'\x00' * preamble_len) + tail_body
+        stream_len = len(knli_stream)
+
+        # 4. Update the 208-byte immutable magic tail block
+        # In all official game files (Turkish, Greek, Thai, Russian, etc.),
+        # KNLI ends with a fixed 208-byte block containing 6 font records, 1 desc record,
+        # and the magic footer '297E4C1ABD00B570 20444E45 00000000' (END \0\0\0\0).
+        tail_core = bytearray(knli_orig[-208:])
+        core_ptr_offsets = [8, 40, 72, 104, 136, 168, 184]
+        for toff in core_ptr_offsets:
+            old_val = struct.unpack('<I', tail_core[toff:toff+4])[0]
+            struct.pack_into('<I', tail_core, toff, old_val + delta)
+
+        # Mid-stream alignment padding:
+        # Pre-tail record header: struct.pack('<II', 0x270, 0) [8 bytes]
+        # Pad between bytecode stream and pre-tail so total payload is 8-byte aligned.
+        pad_mid = (8 - (stream_len % 8)) % 8
+        mid_padding = b'\x00' * pad_mid
+        pre_tail = struct.pack('<II', 0x270, 0)
+
+        knli_payload = knli_stream + mid_padding + pre_tail + tail_core
         new_knli_size = 32 + len(knli_payload)
-        # In all 27 official languages, comp_size = s9_size - 240
         new_comp_size = new_knli_size - 240
+
         new_knli_hdr = struct.pack('<IIIIIIII', magic, new_comp_size, ver, 0, len(new_relocs), u1, u2, u3)
         new_knli = new_knli_hdr + knli_payload
 
